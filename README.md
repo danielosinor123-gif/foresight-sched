@@ -49,14 +49,19 @@ never proprietary hardware.
 
 ## The long run — what we hope to achieve
 
-> **Status (Oct 22, 2026): Phase 0 ✅ COMPLETE · Phase 1 ✅ core shipped
-> (live classification loop proven on the real kernel) · 24h soak
-> running · full receipts in [PHASE-0-1-REPORT.md](PHASE-0-1-REPORT.md)**
+> **Status (Oct 23, 2026): Phase 0 ✅ COMPLETE — including the 28.0h soak
+> (573,624 scheduling decisions, zero anomalies, zero panics, clean unload
+> at the end) · Phase 1 ✅ core shipped (live classification loop proven
+> on the real kernel) · full receipts in
+> [PHASE-0-1-REPORT.md](PHASE-0-1-REPORT.md)**
 
-**Phase 0 — Prove the loop (now ✅, Oct 21 2026).**
+**Phase 0 — Prove the loop (now ✅, Oct 21 2026; soak gate closed Oct 23).**
 A minimal sched_ext scheduler loads in a VM, survives the verifier, runs
 the system, and unloads cleanly back to the default scheduler.
 *Done when: boot → load → run 24h → unload, zero kernel panics.*
+**✅ RECEIPTS: 28.0h continuous soak, 573,624 scheduling decisions,
+zero anomalies, zero panics, single uninterrupted load (no restarts),
+clean unload after the run ("EXIT: unregistered from user space").**
 
 **Phase 1 — Workload-class awareness.**
 Scheduler policy that treats interactive, batch and ML-class tasks

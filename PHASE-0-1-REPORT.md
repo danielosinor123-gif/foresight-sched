@@ -94,12 +94,22 @@ opinions; tests are expensive facts; both gates fired.
 4. **PowerShell quoting is hostile to inline bash** — every non-trivial
    WSL command went through script files copied in and LF-normalized.
 
-## Soak status & commands
+## Soak status — FINAL (Oct 23, 2026): PASSED
 
-- Running: scheduler + load spinner, both `timeout 86400`-capped.
-- Check: `wsl -d Ubuntu-24.04 -u root -- tail -2 /root/soak-sched.log`
-  and `wsl -d Ubuntu-24.04 -u root -- cat /sys/kernel/sched_ext/state`
-- Stop early: `wsl -d Ubuntu-24.04 -u root -- bash -c "pkill -INT foresight_sched; pkill yes"`
+| Receipt | Value |
+|---|---|
+| Duration | 28.0 hours continuous (100,947 s — ran past the 24h gate) |
+| Scheduling decisions | 573,624 |
+| Restarts during run | 0 (single uninterrupted scheduler load) |
+| Panics / anomalies / verifier refusals | 0 / 0 / 0 |
+| Clean unload after the run | "EXIT: unregistered from user space", state → disabled, 0 pins |
+
+Engineering finding #5: the `timeout 86400` wrapper never fired —
+host sleep cycles defeated the guest-side timer (WSL2 clock skew vs
+`setitimer` deadlines; the log ticked smoothly across the 86,400s
+mark). Long guest-side soaks need an in-guest wall-clock watchdog,
+not a host-side timeout wrapper. Stopped manually at 28h; the manual
+SIGINT doubled as the clean-unload-after-long-run test — passed.
 
 ## Honest remaining gaps
 

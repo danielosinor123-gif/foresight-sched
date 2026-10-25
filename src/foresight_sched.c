@@ -21,6 +21,10 @@
  *	- map "task_class": BPF hash, key u32 pid, value u8 class
  *	  (0 = normal, 1 = interactive, 2 = batch)
  *	- map "stats": BPF array, key u32 0..2, value u64 enqueue counters
+ *	- PHASE 2 maps: "knobs" (1-entry ARRAY: key u32 0 ->
+ *	  struct sched_knobs, 24 bytes), "demotions" (HASH: u32 pid ->
+ *	  struct demotion_event, 16 bytes), "task_meta" (HASH,
+ *	  kernel-private streak state, deliberately NOT pinned)
  *	- UEI_DEFINE(uei) exit-info block named "uei"
  * If Writer A renames any of these, this file fails to COMPILE (unknown
  * skeleton struct field) - the loudest failure we can engineer. Map
@@ -165,10 +169,44 @@ enum foresight_class {
  * so a separate process can translate namespace pids (via pid_probe)
  * and live-update classifications (via task_class) using bpftool.
  * Pins exist only while the scheduler runs; teardown always unpins.
+ *
+ * PHASE 2 (shared contract) extends the ladder: the daemon also
+ * reads the per-class enqueue counters (stats), rewrites the
+ * runtime knob struct (knobs: lane slices + demotion threshold),
+ * and drains demotion events (demotions) - so all three join the
+ * pins below, same discipline. task_meta is NOT pinned: it is
+ * kernel-private streak state with no daemon consumer.
  */
 #define PIN_DIR			"/sys/fs/bpf/foresight"
 #define PIN_TASK_CLASS		(PIN_DIR "/task_class")
 #define PIN_PID_PROBE		(PIN_DIR "/pid_probe")
+#define PIN_STATS		(PIN_DIR "/stats")
+#define PIN_KNOBS		(PIN_DIR "/knobs")
+#define PIN_DEMOTIONS		(PIN_DIR "/demotions")
+
+/*
+ * PHASE 2 (shared contract): value of the single-entry "knobs"
+ * ARRAY map. MUST byte-match `struct sched_knobs` in
+ * foresight_sched.bpf.c (u64 interactive_slice_ns; u64
+ * batch_slice_ns; u32 demote_streak; u32 _pad = 24 bytes). The
+ * loader seeds knobs[0] once after load; the daemon rewrites it
+ * through the pin at runtime. Drift is loud, not silent: the
+ * kernel checks exact key/value sizes on update, so a struct edit
+ * on either side that breaks the 4/24 byte contract fails the
+ * checked seed below.
+ */
+struct foresight_knobs {
+	__u64	interactive_slice_ns;
+	__u64	batch_slice_ns;
+	__u32	demote_streak;
+	__u32	_pad;
+};
+
+/*
+ * Contract seed for demote_streak: demote an interactive-classified
+ * task after 10 consecutive full-slice exhaustions.
+ */
+#define KNOBS_DEMOTE_STREAK_DFL	10
 
 /*
  * Phase 1 classification rules table: /proc/<pid>/comm (at most 15 chars;
@@ -328,11 +366,20 @@ static void warn_if_pid_namespaced(int nr_seeded)
  * Release the pinned paths on every post-pin exit path (error or
  * normal teardown), so a crashed or killed loader never leaves a stale
  * pin for the next run to trip over. Both unpins are best-effort.
+ *
+ * PHASE 2 (shared contract): the three new pins (stats, knobs,
+ * demotions) join the same best-effort sweep - bpf_map__unpin() on
+ * a not-pinned map is a harmless no-op error, so callers can fire
+ * this on any post-pin failure path without tracking which rungs
+ * of the pin ladder they reached.
  */
 static void unpin_maps(struct foresight_sched *skel)
 {
 	bpf_map__unpin(skel->maps.task_class, PIN_TASK_CLASS);
 	bpf_map__unpin(skel->maps.pid_probe, PIN_PID_PROBE);
+	bpf_map__unpin(skel->maps.stats, PIN_STATS);
+	bpf_map__unpin(skel->maps.knobs, PIN_KNOBS);
+	bpf_map__unpin(skel->maps.demotions, PIN_DEMOTIONS);
 }
 
 /*
@@ -390,6 +437,33 @@ static int verify_map_contract(struct foresight_sched *skel)
 		return -1;
 	}
 
+	/*
+	 * Phase 2 maps (reviewer 4a note 6): demotions and task_meta
+	 * must be HASH, key u32, value 16 bytes (struct demotion_event
+	 * and struct task_meta are both sizeof 16) - a reordered struct
+	 * would silently misparse in the daemon otherwise.
+	 */
+	key_sz = bpf_map__key_size(skel->maps.demotions);
+	val_sz = bpf_map__value_size(skel->maps.demotions);
+	type = bpf_map__type(skel->maps.demotions);
+	if (key_sz != sizeof(__u32) || val_sz != 16 ||
+	    type != BPF_MAP_TYPE_HASH) {
+		fprintf(stderr,
+			"foresight_sched: demotions contract violated: expected HASH key u32 value 16 bytes (got %zu/%zu type %d); fix foresight_sched.bpf.c\n",
+			key_sz, val_sz, (int)type);
+		return -1;
+	}
+	key_sz = bpf_map__key_size(skel->maps.task_meta);
+	val_sz = bpf_map__value_size(skel->maps.task_meta);
+	type = bpf_map__type(skel->maps.task_meta);
+	if (key_sz != sizeof(__u32) || val_sz != 16 ||
+	    type != BPF_MAP_TYPE_HASH) {
+		fprintf(stderr,
+			"foresight_sched: task_meta contract violated: expected HASH key u32 value 16 bytes (got %zu/%zu type %d); fix foresight_sched.bpf.c\n",
+			key_sz, val_sz, (int)type);
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -428,6 +502,44 @@ static int seed_class_map(struct foresight_sched *skel, const __u32 *pids,
 
 		if (ret)
 			return ret;
+	}
+	return 0;
+}
+
+/*
+ * PHASE 2 (shared contract): seed knobs[0] = { SCX_SLICE_DFL,
+ * SCX_SLICE_DFL, 10, 0 } - once, right after load and BEFORE any
+ * pin or attach. ARRAY maps are created zeroed by the kernel: an
+ * unseeded knobs map would mean 0ns slices and a disabled engine,
+ * so the seed must beat the first enqueue. The BPF side keeps its
+ * own SCX_SLICE_DFL / demotion-off fallback for the zero case
+ * (defense in depth, also part of the contract), but the seed is
+ * what makes the daemon's first read of the pinned file meaningful.
+ * SCX_SLICE_DFL comes from the SCX_OPS_OPEN-populated rodata
+ * (checked non-zero right after open above). Runs on every
+ * kernel-initiated restart too: each reload gets a fresh, zeroed
+ * knobs map in the new skeleton, and this is what re-seeds it.
+ */
+static int seed_knobs(struct foresight_sched *skel)
+{
+	__u32 key = 0;
+	struct foresight_knobs knobs = {
+		.interactive_slice_ns = skel->rodata->__SCX_SLICE_DFL,
+		.batch_slice_ns = skel->rodata->__SCX_SLICE_DFL,
+		.demote_streak = KNOBS_DEMOTE_STREAK_DFL,
+		._pad = 0,
+	};
+	int ret;
+
+	ret = bpf_map__update_elem(skel->maps.knobs,
+				   &key, sizeof(key),
+				   &knobs, sizeof(knobs),
+				   BPF_ANY);
+	if (ret) {
+		fprintf(stderr,
+			"foresight_sched: knobs seed failed (ret=%d, %s); expected a loaded 1-entry ARRAY { key u32 -> 24-byte struct sched_knobs } from foresight_sched.bpf.c - refusing to attach with zero slices\n",
+			ret, strerror(-ret));
+		return ret;
 	}
 	return 0;
 }
@@ -590,6 +702,21 @@ restart:
 	}
 
 	/*
+	 * PHASE 2 (shared contract): seed the runtime knobs before any
+	 * pin exists (the daemon's first read of the pinned file is
+	 * never a zeroed one) and before attach (no enqueue can ever
+	 * observe the zeroed ARRAY). Same failure discipline as the
+	 * class seeding below: a checked failure aborts before we ever
+	 * take over scheduling. This call site sits after the restart
+	 * label, so every kernel-initiated reload re-seeds the fresh
+	 * knobs map too.
+	 */
+	if (seed_knobs(skel)) {
+		foresight_sched__destroy(skel);
+		return EXIT_FAILURE;
+	}
+
+	/*
 	 * PHASE 1 (maintainer addition): pin the two maps for the Foresight
 	 * classification daemon. Stale pins from a crashed run are unlinked
 	 * first; every failure path below unwinds the pins it created.
@@ -597,6 +724,9 @@ restart:
 	mkdir(PIN_DIR, 0755);			/* idempotent */
 	unlink(PIN_TASK_CLASS);
 	unlink(PIN_PID_PROBE);
+	unlink(PIN_STATS);
+	unlink(PIN_KNOBS);
+	unlink(PIN_DEMOTIONS);
 	if (bpf_map__pin(skel->maps.task_class, PIN_TASK_CLASS)) {
 		fprintf(stderr,
 			"foresight_sched: failed to pin task_class at %s (is /sys/fs/bpf mounted as bpffs? errno=%d)\n",
@@ -609,6 +739,44 @@ restart:
 			"foresight_sched: failed to pin pid_probe at %s (errno=%d)\n",
 			PIN_PID_PROBE, errno);
 		bpf_map__unpin(skel->maps.task_class, PIN_TASK_CLASS);
+		foresight_sched__destroy(skel);
+		return EXIT_FAILURE;
+	}
+	/*
+	 * PHASE 2 (shared contract): stats, knobs and demotions join the
+	 * pin ladder after task_class/pid_probe, same unwinding
+	 * discipline as the rungs above - each failure unpins exactly
+	 * what the rungs before it created, then destroys the
+	 * skeleton, so a failed run never leaves a stale pin for the
+	 * next run to trip over.
+	 */
+	if (bpf_map__pin(skel->maps.stats, PIN_STATS)) {
+		fprintf(stderr,
+			"foresight_sched: failed to pin stats at %s (errno=%d)\n",
+			PIN_STATS, errno);
+		bpf_map__unpin(skel->maps.task_class, PIN_TASK_CLASS);
+		bpf_map__unpin(skel->maps.pid_probe, PIN_PID_PROBE);
+		foresight_sched__destroy(skel);
+		return EXIT_FAILURE;
+	}
+	if (bpf_map__pin(skel->maps.knobs, PIN_KNOBS)) {
+		fprintf(stderr,
+			"foresight_sched: failed to pin knobs at %s (errno=%d)\n",
+			PIN_KNOBS, errno);
+		bpf_map__unpin(skel->maps.task_class, PIN_TASK_CLASS);
+		bpf_map__unpin(skel->maps.pid_probe, PIN_PID_PROBE);
+		bpf_map__unpin(skel->maps.stats, PIN_STATS);
+		foresight_sched__destroy(skel);
+		return EXIT_FAILURE;
+	}
+	if (bpf_map__pin(skel->maps.demotions, PIN_DEMOTIONS)) {
+		fprintf(stderr,
+			"foresight_sched: failed to pin demotions at %s (errno=%d)\n",
+			PIN_DEMOTIONS, errno);
+		bpf_map__unpin(skel->maps.task_class, PIN_TASK_CLASS);
+		bpf_map__unpin(skel->maps.pid_probe, PIN_PID_PROBE);
+		bpf_map__unpin(skel->maps.stats, PIN_STATS);
+		bpf_map__unpin(skel->maps.knobs, PIN_KNOBS);
 		foresight_sched__destroy(skel);
 		return EXIT_FAILURE;
 	}
@@ -670,15 +838,45 @@ restart:
 	}
 
 	/*
-	 * Attach the struct_ops. SCX_OPS_ATTACH() (compat.h) calls the
-	 * skeleton's attach-all, which auto-attaches the pid_probe
-	 * tracepoint (SEC("tp/...") programs are auto-attachable) AND
-	 * returns the struct_ops link. Phase 1 lesson learned the hard
-	 * way: do NOT attach the tracepoint manually as well - the
-	 * duplicate attach fails with -EEXIST and SCX_BUG exits without
-	 * cleanup, orphaning the pins.
+	 * Attach the struct_ops. Hand-expansion of SCX_OPS_ATTACH()
+	 * (compat.h:190-197) - same discipline as the Phase 1
+	 * hand-expansion of SCX_OPS_LOAD, for the same reason the
+	 * kernel reviewer found (Phase 2 finding 2): the macro's
+	 * SCX_BUG exit bypasses cleanup, and an attach failure (e.g.
+	 * another sched_ext scheduler already loaded, EBUSY) would
+	 * orphan all five pins on a dead process.
+	 *
+	 * Engineering lesson #6 (found live in acceptance): the macro's
+	 * FIRST statement (compat.h:192) is mandatory on libbpf >= 1.5
+	 * - without disabling struct_ops auto-attach, the skeleton's
+	 * attach-all attaches the ops map itself and the explicit
+	 * attach below becomes a DUPLICATE, which the kernel rejects
+	 * with -EBUSY ("link already exists"). Hand-expand from the
+	 * source, never from a review's transcription: the first
+	 * attempt omitted this line and EBUSY'd twice.
 	 */
-	link = SCX_OPS_ATTACH(skel, foresight_sched, foresight_sched);
+#if LIBBPF_MAJOR_VERSION > 1 || \
+	(LIBBPF_MAJOR_VERSION == 1 && LIBBPF_MINOR_VERSION >= 5)
+	bpf_map__set_autoattach(skel->maps.foresight_sched, false);
+#endif
+	err = foresight_sched__attach(skel);
+	if (err) {
+		fprintf(stderr,
+			"foresight_sched: skeleton attach failed (ret=%d); unpinning and exiting\n",
+			err);
+		unpin_maps(skel);
+		foresight_sched__destroy(skel);
+		return EXIT_FAILURE;
+	}
+	link = bpf_map__attach_struct_ops(skel->maps.foresight_sched);
+	if (!link) {
+		fprintf(stderr,
+			"foresight_sched: struct_ops attach failed (is another sched_ext scheduler loaded? errno=%d)\n",
+			errno);
+		unpin_maps(skel);
+		foresight_sched__destroy(skel);
+		return EXIT_FAILURE;
+	}
 
 	/*
 	 * PHASE 1: verify the auto-attached pid_probe landed; without it

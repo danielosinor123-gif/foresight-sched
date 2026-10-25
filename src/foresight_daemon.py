@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-foresight_daemon.py - Phase 1 LIVE classification daemon for the
-foresight_sched sched_ext scheduler (stdlib-only Python 3).
+foresight_daemon.py - Phase 1 live classification + Phase 2
+telemetry-driven self-tuning daemon for the foresight_sched
+sched_ext scheduler (stdlib-only Python 3).
 
 WHAT IT DOES
 ============
@@ -119,6 +120,84 @@ drift but first classified after it is keyed with the new offset
 (exposure bounded by one recheck interval - identical in the old
 design, which additionally corrupted every already-tracked task).
 
+PHASE 2 (telemetry-driven self-tuning) - additive, same loop
+============================================================
+Two new controllers share the existing 2s loop, its signal
+discipline and its exception ladder (NO new exit codes:
+SchedulerGone -> clean exit 0, bpftool failures -> fail_streak ->
+exit 10, exactly like classification):
+
+1. Adaptive-knob controller (run_knob_cycle). Reads the pinned
+   `stats` ARRAY (a Phase 0 map, NEWLY PINNED in Phase 2: key u32
+   0..2 -> u64 per-class enqueue counters, 0=normal 1=interactive
+   2=batch) every cycle and derives per-lane enqueue RATES from
+   counter deltas over the MEASURED wall time between reads - never
+   the nominal 2s, because an offset-recheck pass runs a probe pair
+   with a 6s poll window and a large demotion backlog also stretches
+   a pass; dividing those deltas by 2.0 would overstate the rate up
+   to ~4x and could fire the hot rule on a quiet system. An EWMA
+   (alpha 0.3) of the interactive rate drives a single-knob
+   hysteresis on the ONE field v1 owns, knobs[0].interactive_slice_ns:
+     - the first 10 rate observations are warmup, observation-only;
+     - EWMA > 50/s on 3 consecutive evaluated cycles -> 10ms;
+     - EWMA < 25/s on 5 consecutive evaluated cycles -> back to 20ms;
+     - every actual change prints ONE explainable line: old value,
+       new value, the EWMA number, the rule, the consecutive-cycle
+       count. There are NO other knob writes in the daemon.
+   The write is a full-struct read-modify-write: the current knobs[0]
+   is dumped and re-uploaded with batch_slice_ns, demote_streak and
+   _pad copied through untouched (knobs_rebuild). The daemon ADOPTS
+   the live value read-only at startup - a previous daemon generation
+   may have left 10ms in place, and assuming the loader's seed would
+   print a bogus 'old value' on the first firing. A knobs[0] value
+   that is not exactly the contract's 24 bytes latches knob writes
+   off for the rest of the run instead of corrupting a struct whose
+   layout the daemon does not recognize.
+
+2. Behavior-demotion listener (drain_demotions). The kernel
+   behavior-demotes a task (interactive -> batch after demote_streak
+   consecutive full slices) and records the event in the pinned
+   `demotions` HASH: key u32 KERNEL-GLOBAL pid -> { u64 ts_ns;
+   u8 from_class; u8 to_class; u16 streak; }. Each cycle the daemon
+   dumps the map, prints ONE explainable line per event, adopts the
+   pid into `kernel_managed`, and DELETES the entry (the event
+   lifecycle is the daemon's job in userspace; the kernel never
+   reclaims entries).
+   THE CROSS-COMPONENT SUBTLETY - this is the one that matters: the
+   classifier SKIPS every pid in kernel_managed. Without the skip,
+   the daemon's comm-based re-classification would overwrite the
+   kernel's demotion every 2s cycle and the kernel would re-demote
+   forever: classify interactive -> kernel demotes -> daemon
+   re-classifies interactive -> ... With it, classification
+   authority for that pid passes to the kernel for the pid's
+   remaining life (only reaps still run: a kernel-managed pid that
+   dies or stops comm-matching must not leave a stale task_class
+   entry - pid-reuse hygiene outranks the handoff). Entries are
+   KERNEL-GLOBAL pids (the demotions key space, same as task_class),
+   so reconcile compares them against the exact global pid it would
+   itself write (recorded global pid for tracked tasks; ns_pid + live
+   offset for first sightings). Entries leave the set when the pid
+   disappears from /proc - retired each pass against the global pids
+   of every live task, which is exact for daemon-tracked tasks and
+   cohort-approximate for untracked ones (the same one-window
+   aliasing residual the Phase 1 limitations already document).
+   kernel_managed is per-daemon-generation: after a daemon restart a
+   still-demoted task costs at most one extra demotion round before a
+   fresh event re-registers it.
+
+Preflight now demands all FIVE pins (task_class, pid_probe, stats,
+knobs, demotions) with the same "is the scheduler running?"
+discipline (exit 2): a Phase 1-only scheduler is refused outright,
+never quietly half-driven. The in-loop pins_exist() check
+deliberately still keys off the two Phase 1 pins - the loader pins
+and unpins the whole set as one unit, so they vanish exactly when
+the scheduler does. A detected scheduler restart (map-id change)
+resets ALL Phase 2 bookkeeping: fresh counters (the EWMA baseline
+described a dead instance), a fresh loader-seeded knobs value
+(re-adopted read-only next cycle), and an empty demotions map
+(kernel_managed dies with the old instance; live demoted tasks
+re-register through fresh events).
+
 HOW TO RUN (WSL2 gotchas found the hard way, empirically)
 =========================================================
 Run INSIDE the WSL2 distro as root, where the scheduler was started:
@@ -171,6 +250,7 @@ import os
 import random
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -182,6 +262,21 @@ import time
 PIN_DIR = "/sys/fs/bpf/foresight"
 PIN_TASK_CLASS = PIN_DIR + "/task_class"  # BPF hash: u32 global pid -> u8 class
 PIN_PID_PROBE = PIN_DIR + "/pid_probe"    # BPF hash: char[16] comm -> u32 global pid
+# Phase 2 pins (contract with the BPF side + loader; all five pins live
+# and die with the scheduler exactly like the two above):
+#   stats:     ARRAY, key u32 0..2 -> u64 per-class enqueue counters
+#              (0=normal, 1=interactive, 2=batch). The MAP exists since
+#              Phase 0; the PIN is new in Phase 2.
+#   knobs:     ARRAY, key u32 0 -> struct { u64 interactive_slice_ns;
+#              u64 batch_slice_ns; u32 demote_streak; u32 _pad; },
+#              loader-seeded to {20000000, 20000000, 10, 0}. The daemon
+#              rewrites ONLY interactive_slice_ns (read-modify-write).
+#   demotions: HASH, key u32 KERNEL-GLOBAL pid -> struct { u64 ts_ns;
+#              u8 from_class; u8 to_class; u16 streak; }, written by
+#              the KERNEL on behavior demotion; read + DELETED here.
+PIN_STATS = PIN_DIR + "/stats"          # Phase 2: enqueue counters
+PIN_KNOBS = PIN_DIR + "/knobs"          # Phase 2: tunable knobs
+PIN_DEMOTIONS = PIN_DIR + "/demotions"  # Phase 2: kernel demotion events
 
 # Workload classes: the wire format of the task_class map value (u8) and
 # the stats map keys. MUST match enum foresight_class in foresight_sched.c
@@ -225,7 +320,43 @@ LOOP_FAIL_GIVEUP = 10          # consecutive wholly-failed loop passes
 # applies only to tasks first seen afterwards (reviewer BLOCKING fix:
 # the old delete-and-re-key "repair" corrupted correct entries).
 OFFSET_RECHECK_PASSES = 15
+MAP_ID_CHECK_PASSES = 5   # map-id liveness sweep every N passes (maintainer
+                          # fix: 5 bpftool shows per pass was 50-90% of the
+                          # pass cost under load; see call site in main())
 RECHECK_GIVEUP = 5             # consecutive failed rechecks before dying
+
+# Phase 2 controller tuning (adaptive knob + demotion listener).
+# The loader seeds knobs[0] = {20000000, 20000000, 10, 0}. Phase 2 v1
+# owns exactly ONE field, interactive_slice_ns, with this hysteresis:
+#   interactive enqueue-rate EWMA > 50/s on 3 consecutive evaluated
+#     cycles -> interactive_slice_ns = 10ms;
+#   EWMA < 25/s on 5 consecutive evaluated cycles -> back to 20ms.
+# Comparisons are STRICT per the contract: exactly 50.0/s or 25.0/s
+# falls in the deadband and breaks both consecutive runs.
+INTERACTIVE_SLICE_DEFAULT = 20000000
+INTERACTIVE_SLICE_FAST = 10000000
+KNOB_EWMA_ALPHA = 0.3
+KNOB_WARMUP_SAMPLES = 10     # first 10 rate observations: warmup only
+KNOB_HOT_RATE = 50.0
+KNOB_HOT_STREAK = 3
+KNOB_COOL_RATE = 25.0
+KNOB_COOL_STREAK = 5
+KNOB_STATUS_EVERY = 15       # one visibility line per ~30s of cycles
+
+# knobs value struct (Phase 2 contract, x86-64 raw memory image):
+#   struct { u64 interactive_slice_ns; u64 batch_slice_ns;
+#            u32 demote_streak; u32 _pad; }  -> sizeof 24, natural
+# alignment, no holes. "<QQII" reproduces it byte for byte; the RMW
+# write refuses any blob that is not exactly this size.
+KNOBS_VALUE_FMT = "<QQII"
+KNOBS_VALUE_SIZE = struct.calcsize(KNOBS_VALUE_FMT)
+
+# demotions value struct (Phase 2 contract): u64 ts_ns; u8 from_class;
+# u8 to_class; u16 streak; + 4 bytes tail padding (8-aligned C struct,
+# sizeof 16). unpack_from reads the 12-byte body; a shorter blob is a
+# contract violation and is never adopted.
+DEMOTION_VALUE_FMT = "<QBBH"
+DEMOTION_VALUE_MIN = struct.calcsize(DEMOTION_VALUE_FMT)
 
 # --test mode tuning.
 TEST_CHILD_SECONDS = 20
@@ -781,7 +912,7 @@ def scan_proc_comms():
     return out
 
 
-def reconcile(rules, offset, state, failcount, abandoned):
+def reconcile(rules, offset, state, failcount, abandoned, kernel_managed=None):
     """Bring task_class in line with what /proc says, printing changes only.
 
     state:      {namespaced pid -> (global pid written, class)} - the
@@ -792,13 +923,39 @@ def reconcile(rules, offset, state, failcount, abandoned):
                 drifts; see header)
     failcount:  {namespaced pid -> consecutive update failures}
     abandoned:  {namespaced pid} we gave up updating this run
+    kernel_managed: (Phase 2) mutable set of KERNEL-GLOBAL pids the
+                kernel behavior-demoted (drained from the `demotions`
+                map). Classification writes for these pids are SKIPPED
+                - the kernel owns them now - and entries leave the set
+                when the pid disappears from /proc. None (the default)
+                behaves as an empty set, so pre-Phase 2 callers work.
     """
+    if kernel_managed is None:
+        kernel_managed = set()
     comms = scan_proc_comms()
     desired = {}
     for ns_pid, comm in comms.items():
         cls = rules.get(comm)
         if cls is not None:
             desired[ns_pid] = (cls, comm)
+
+    # Phase 2 (behavior-demotion listener bookkeeping): a kernel-managed
+    # pid leaves the skip set once it disappears from /proc, so a
+    # recycled global pid is never blocked forever. The "still alive"
+    # candidates are the RECORDED global pids of tracked tasks (exact -
+    # a task's global pid never changes, see header) plus the cohort
+    # arithmetic ns_pid + live offset for tasks never tracked
+    # (approximate: the same one-window aliasing residual the Phase 1
+    # limitations already document; an untracked entry can also expire
+    # early right after an offset drift, which self-heals - the kernel
+    # re-demotes and a fresh event re-registers the pid).
+    if kernel_managed:
+        candidates = {rec[0] for rec in state.values()}
+        candidates.update(ns + offset for ns in comms)
+        for gpid in sorted(kernel_managed - candidates):
+            kernel_managed.discard(gpid)
+            log("kernel-managed global pid %d left /proc; releasing "
+                "the classification skip" % gpid)
 
     # 1) New or changed classifications.
     for ns_pid in sorted(desired):
@@ -821,6 +978,20 @@ def reconcile(rules, offset, state, failcount, abandoned):
         # overshoot it (reviewer BLOCKING fix; see header). Only a
         # task first seen now is keyed with the current offset.
         gpid = entry[0] if entry is not None else ns_pid + offset
+        # Phase 2 (THE cross-component subtlety): the kernel behavior-
+        # demoted this task (event drained from `demotions` this same
+        # pass); the classifier MUST NOT write it again. Without this
+        # skip the comm-based re-classification below would overwrite
+        # the kernel's demotion every 2s cycle and the kernel would
+        # re-demote forever (classify interactive -> kernel demotes ->
+        # daemon re-classifies interactive -> ...). The comparison is in
+        # GLOBAL pids - the demotions key space, same as task_class -
+        # against the exact global pid this pass would write. A
+        # comm-driven class CHANGE for a kernel-managed pid is likewise
+        # deferred until the pid leaves /proc: v1 hands the pid to the
+        # kernel wholesale rather than second-guessing the demotion.
+        if gpid in kernel_managed:
+            continue
         ok, err = update_task_class(gpid, cls)
         if ok:
             state[ns_pid] = (gpid, cls)
@@ -869,7 +1040,7 @@ def reconcile(rules, offset, state, failcount, abandoned):
                 "(%s); dropping tracking only" % (gpid, cls, err))
 
 
-def check_map_ids(initial_ids, state, failcount, abandoned):
+def check_map_ids(initial_ids, state, failcount, abandoned, phase2=None):
     """Detect a scheduler restart that was too fast for the pins check.
 
     A fresh scheduler instance pins NEW map objects; bpftool's map id
@@ -879,6 +1050,14 @@ def check_map_ids(initial_ids, state, failcount, abandoned):
     key that does exist was written against this very map and would
     otherwise be orphaned with no owner left to reap it. Every
     classification is then re-written from scratch.
+
+    Phase 2 (phase2 given): the restart also resets ALL Phase 2
+    bookkeeping - the fresh stats counters start at zero (old
+    EWMA/streak state describes a dead instance), the fresh loader
+    re-seeded knobs (re-adopted read-only on the next controller
+    cycle), and the fresh demotions map is empty (kernel_managed dies
+    with the old instance; still-demoted tasks re-register through
+    fresh events).
     """
     changed = None
     for pin, old_id in initial_ids.items():
@@ -893,6 +1072,463 @@ def check_map_ids(initial_ids, state, failcount, abandoned):
             "from scratch"
             % (os.path.basename(pin), old_id, new_id, len(state)))
         _drop_all_state(state, failcount, abandoned)
+        if phase2 is not None:
+            # Phase 2: fresh maps on every axis - see docstring.
+            phase2.reset()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: adaptive-knob controller + behavior-demotion listener
+# ---------------------------------------------------------------------------
+
+class KnobController:
+    """Phase 2 hysteresis state machine over the interactive enqueue
+    rate. PURE LOGIC - no bpftool, no clocks: the loop feeds it one
+    rate observation per cycle and executes any returned action. That
+    keeps the whole policy unit-testable offline
+    (foresight_phase2_tests.py).
+
+    Rules (see the Phase 2 header section and the constants above):
+      - EWMA (alpha 0.3) over the interactive lane's enqueue rate;
+        the first observation seeds it.
+      - Warmup: the first KNOB_WARMUP_SAMPLES observations are
+        observation-only - no streaks accumulate, no rule may fire.
+      - HOT:  ewma > 50/s on 3 consecutive evaluated cycles ->
+              interactive_slice_ns = 10ms (INTERACTIVE_SLICE_FAST).
+      - COOL: ewma < 25/s on 5 consecutive evaluated cycles ->
+              interactive_slice_ns = 20ms (INTERACTIVE_SLICE_DEFAULT).
+      - Only actual CHANGES return an action: while the knob already
+        sits at the target value, sustained rates stay silent. A
+        FAILED write keeps the old belief, so the same rule re-fires
+        on later cycles - the streak IS the retry mechanism.
+    """
+
+    def __init__(self):
+        self.ewma = None          # None until the first observation
+        self.samples = 0          # rate observations incorporated
+        self.hot_streak = 0       # consecutive evaluated cycles > 50/s
+        self.cool_streak = 0      # consecutive evaluated cycles < 25/s
+        self.slice_ns = INTERACTIVE_SLICE_DEFAULT  # last CONFIRMED value
+        self.synced = False       # True once adopted from the live map
+
+    def reset(self):
+        """Scheduler restart (fresh maps): drop the baseline AND the
+        knob belief. Restarting the warmup is deliberate - the fresh
+        counters start at zero, so old EWMA/streak state describes a
+        scheduler instance that no longer exists."""
+        self.ewma = None
+        self.samples = 0
+        self.hot_streak = 0
+        self.cool_streak = 0
+        self.slice_ns = INTERACTIVE_SLICE_DEFAULT
+        self.synced = False
+
+    def adopt(self, slice_ns):
+        """Believe the value the live map holds (startup, or after a
+        detected scheduler restart). Phase 2 never WRITES here: a
+        previous daemon generation may have left the knob at 10ms,
+        and assuming the loader's 20ms seed would print a bogus 'old
+        value' on the first rule firing."""
+        self.slice_ns = slice_ns
+        self.synced = True
+
+    def apply(self, slice_ns):
+        """Confirm one successful knob write. Called ONLY on bpftool
+        success: on failure the belief keeps the old value so the
+        rule re-fires next cycle (natural, self-healing retry)."""
+        self.slice_ns = slice_ns
+
+    def observe(self, rate):
+        """Feed one interactive-rate observation. Returns None, or an
+        action ("hot"/"cool", target_slice_ns, consecutive_cycles,
+        ewma) when a rule fires an actual change."""
+        # EWMA update: first observation seeds; afterwards the
+        # standard blend with alpha = KNOB_EWMA_ALPHA = 0.3.
+        if self.ewma is None:
+            self.ewma = float(rate)
+        else:
+            self.ewma = (KNOB_EWMA_ALPHA * rate
+                         + (1.0 - KNOB_EWMA_ALPHA) * self.ewma)
+        self.samples += 1
+        # Baseline warmup (Phase 2 rule): the first KNOB_WARMUP_SAMPLES
+        # observations are observation-only. Streaks only accumulate
+        # on evaluated cycles, so a rule needs its full consecutive
+        # run AFTER warmup ends.
+        if self.samples <= KNOB_WARMUP_SAMPLES:
+            return None
+        if self.ewma > KNOB_HOT_RATE:
+            self.hot_streak += 1
+            self.cool_streak = 0
+            if (self.hot_streak >= KNOB_HOT_STREAK
+                    and self.slice_ns != INTERACTIVE_SLICE_FAST):
+                return ("hot", INTERACTIVE_SLICE_FAST,
+                        self.hot_streak, self.ewma)
+        elif self.ewma < KNOB_COOL_RATE:
+            self.cool_streak += 1
+            self.hot_streak = 0
+            if (self.cool_streak >= KNOB_COOL_STREAK
+                    and self.slice_ns != INTERACTIVE_SLICE_DEFAULT):
+                return ("cool", INTERACTIVE_SLICE_DEFAULT,
+                        self.cool_streak, self.ewma)
+        else:
+            # Deadband (25/s <= ewma <= 50/s): both consecutive runs
+            # break. Strict comparisons per the Phase 2 contract.
+            self.hot_streak = 0
+            self.cool_streak = 0
+        return None
+
+
+class Phase2State:
+    """All mutable Phase 2 bookkeeping in one object, so the detected
+    scheduler-restart path (check_map_ids) can reset it atomically."""
+
+    def __init__(self):
+        # The adaptive-knob controller (EWMA + hysteresis machine).
+        self.knob = KnobController()
+        # KERNEL-GLOBAL pids the kernel behavior-demoted. reconcile()
+        # MUST skip these - see the Phase 2 header section for why the
+        # skip is the difference between a clean handoff and infinite
+        # 2s-cycle flapping. Key space: kernel-global pids, the same
+        # one task_class and the demotions map use.
+        self.kernel_managed = set()
+        # gpid -> ts_ns of the last event announced for that pid: dedups
+        # the BEHAVIOR DEMOTION line while a demotions delete keeps
+        # failing (the entry stays in the map and re-dumps next cycle).
+        self.seen_demotions = {}
+        # Previous cycle's stats snapshot and its monotonic timestamp:
+        # rate denominators are MEASURED wall time, not the nominal 2s.
+        self.last_stats = None
+        self.last_stats_at = None
+        # Completed controller cycles (drives the ~30s visibility line;
+        # deliberately NOT reset on restart - it is only a cadence).
+        self.cycles = 0
+        # Latched when knobs[0] is absent or not contract-shaped: knob
+        # writes stop for the rest of the run rather than corrupt a
+        # struct whose layout we do not recognize. Cleared by reset().
+        self.writes_disabled = False
+        # One-shot guard for the "rule fired but writes are disabled"
+        # line (the rule keeps re-firing; it must not re-announce).
+        self.disabled_announced = False
+
+    def reset(self):
+        """Scheduler restart (fresh map ids): fresh bookkeeping. The
+        fresh demotions map is empty, so kernel_managed dies with the
+        old instance - a still-demoted task re-demotes under the new
+        one and re-registers itself through a fresh event. The knob
+        controller re-adopts the value the fresh loader seeded."""
+        self.knob.reset()
+        self.kernel_managed.clear()
+        self.seen_demotions.clear()
+        self.last_stats = None
+        self.last_stats_at = None
+        self.writes_disabled = False
+        self.disabled_announced = False
+
+
+def _parse_stats_entries(entries, step):
+    """Phase 2 (PURE, unit-tested): parsed bpftool-JSON dump entries of
+    the stats map -> {class key: u64 counter}. Reuses the existing
+    bpftool-JSON helpers (parse_hex_field).
+
+    The contract is a plain ARRAY (key u32 0..2 -> u64; see
+    foresight_sched.bpf.c), so each value is one 8-byte counter.
+    Defensive extra: the C loader deliberately tolerates a PERCPU_ARRAY
+    stats map as well (its read_stats sums every CPU), so a value blob
+    whose length is a multiple of 8 is SUMMED chunk by chunk instead of
+    trusting one CPU's counter - the daemon's rate math then matches
+    the loader's own accounting. Malformed keys/values are skipped,
+    never fatal: an ARRAY dump always contains all three keys anyway.
+    """
+    out = {}
+    for entry in entries:
+        key = parse_hex_field(entry, "key", step)
+        raw = parse_hex_field(entry, "value", step)
+        if len(key) != 4:
+            continue  # not a u32 class key
+        idx = int.from_bytes(key, "little")
+        if idx not in (CLASS_NORMAL, CLASS_INTERACTIVE, CLASS_BATCH):
+            continue
+        if len(raw) >= 8 and len(raw) % 8 == 0:
+            out[idx] = sum(int.from_bytes(raw[i:i + 8], "little")
+                           for i in range(0, len(raw), 8))
+    return out
+
+
+def read_stats_counters():
+    """Phase 2: one pinned-stats dump -> {class key: u64 counter}."""
+    step = "stats dump (knob controller)"
+    return _parse_stats_entries(dump_map_entries(PIN_STATS, step), step)
+
+
+def _parse_demotion_entry(entry):
+    """Phase 2 (PURE, unit-tested): one parsed bpftool-JSON entry of
+    the demotions map -> (pid, ts_ns, from_class, to_class, streak,
+    raw_key_bytes), or None when the entry violates the contract (bad
+    key length, or a value shorter than the 12-byte struct body). The
+    caller must NOT adopt a None; it deletes the raw entry instead so a
+    malformed event can neither steer the classifier nor spam the log
+    forever. The map key is the task's KERNEL-GLOBAL pid - the same key
+    space as task_class (the BPF side cannot see pids namespace-
+    locally); the listener never translates it.
+    """
+    raw_key = parse_hex_field(entry, "key", "demotions dump")
+    raw_val = parse_hex_field(entry, "value", "demotions dump")
+    if len(raw_key) != 4 or len(raw_val) < DEMOTION_VALUE_MIN:
+        return None
+    pid = int.from_bytes(raw_key, "little")
+    ts_ns, from_cls, to_cls, streak = struct.unpack_from(
+        DEMOTION_VALUE_FMT, raw_val, 0)
+    return pid, ts_ns, from_cls, to_cls, streak, raw_key
+
+
+def knobs_rebuild(raw, new_interactive_slice_ns):
+    """Phase 2 (PURE, unit-tested): the read-modify-write encoding.
+
+    Given the exact 24-byte knobs[0] memory image currently in the
+    map, return that image with interactive_slice_ns replaced and
+    EVERY other field - batch_slice_ns, demote_streak, _pad - copied
+    through bit for bit. Phase 2 v1 owns exactly one field; zeroing or
+    re-packing any other would silently change kernel behavior the
+    daemon has no mandate over. LE "<QQII" is the x86-64 raw memory
+    image of the C struct { u64; u64; u32; u32; } - natural alignment,
+    no holes, sizeof 24 (verified byte for byte in the offline tests).
+    """
+    _old_interactive, batch_ns, demote_streak, pad = struct.unpack(
+        KNOBS_VALUE_FMT, raw)
+    return struct.pack(KNOBS_VALUE_FMT, new_interactive_slice_ns,
+                       batch_ns, demote_streak, pad)
+
+
+def read_knobs(step):
+    """Phase 2: dump knobs[0] -> ((interactive_slice_ns,
+    batch_slice_ns, demote_streak, _pad), raw_bytes), or None when the
+    entry is absent or its size is not exactly the contract's 24
+    bytes. Returning None instead of guessing is the whole point: the
+    caller must refuse to write a struct it cannot parse.
+    """
+    for entry in dump_map_entries(PIN_KNOBS, step):
+        key = parse_hex_field(entry, "key", step)
+        if len(key) != 4 or int.from_bytes(key, "little") != 0:
+            continue  # the contract has exactly one knob, at key 0
+        raw = parse_hex_field(entry, "value", step)
+        if len(raw) != KNOBS_VALUE_SIZE:
+            log("knobctl: knobs[0] value is %d bytes, contract says %d "
+                "(struct { u64 interactive_slice_ns; u64 batch_slice_ns; "
+                "u32 demote_streak; u32 _pad; }); refusing all knob "
+                "writes this run" % (len(raw), KNOBS_VALUE_SIZE))
+            return None
+        return struct.unpack(KNOBS_VALUE_FMT, raw), raw
+    return None
+
+
+def write_knob_interactive_slice(new_slice_ns):
+    """Phase 2: the ONLY knobs write in the daemon - a full-struct
+    read-modify-write of knobs[0] with interactive_slice_ns swapped
+    (batch_slice_ns, demote_streak and _pad ride along untouched, via
+    knobs_rebuild). Returns True only on a confirmed bpftool success.
+
+    Concurrency (reviewer): the contract gives the knobs map exactly
+    two writers - the loader's one-time seed at scheduler start, and
+    this daemon. The kernel only READS knobs and reports through
+    `demotions`, so a torn read-modify-write interleaving is
+    impossible in v1; if a future phase adds a second runtime writer,
+    this needs a compare-and-swap discipline, not silence.
+    """
+    step = "knobs RMW (interactive_slice_ns)"
+    got = read_knobs(step)
+    if got is None:
+        # read_knobs already said why (absent or wrong size); never
+        # fabricate a struct: we do not own the other fields.
+        return False
+    raw_new = knobs_rebuild(got[1], new_slice_ns)
+    key = (0).to_bytes(4, "little")
+    # Same verified argv discipline as update_task_class: ONE TOKEN
+    # PER BYTE (see the bpftool FORMATS section of the header).
+    args = ["map", "update", "pinned", PIN_KNOBS,
+            "key", "hex"] + ["%02x" % b for b in key] + \
+           ["value", "hex"] + ["%02x" % b for b in raw_new]
+    ok, err = run_bpftool(args, step, BPFTOOL_UPDATE_TIMEOUT)
+    if not ok:
+        if not pins_exist():
+            # Pin lifecycle contract: the scheduler stopped mid-write.
+            raise SchedulerGone()
+        log("knobctl: knobs update failed (%s); belief unchanged, the "
+            "rule will retry while it still holds" % err)
+    return ok
+
+
+def _delete_demotion(raw_key, step):
+    """Delete one demotions entry by its EXACT raw key bytes (works
+    even for a malformed key). Not fatal on failure: drain_demotions
+    dedups the announcement and the delete is retried next cycle."""
+    args = ["map", "delete", "pinned", PIN_DEMOTIONS,
+            "key", "hex"] + ["%02x" % b for b in raw_key]
+    ok, err = run_bpftool(args, step, BPFTOOL_UPDATE_TIMEOUT)
+    if not ok:
+        if not pins_exist():
+            raise SchedulerGone()  # pin lifecycle contract
+        log("demotions: delete failed (%s); will retry next cycle" % err)
+
+
+def drain_demotions(phase2):
+    """Phase 2 behavior-demotion listener: dump the pinned `demotions`
+    map; for EACH entry print one explainable line, adopt the pid into
+    kernel_managed, then DELETE the entry - the event lifecycle is the
+    daemon's job in userspace, the kernel never reclaims an entry.
+
+    THE CROSS-COMPONENT SUBTLETY (Phase 2 rule): adopting the pid into
+    kernel_managed is what stops the 2s-cycle flapping. Without the
+    classifier-side skip this set drives, the daemon's comm-based
+    re-classification would overwrite the kernel's demotion every
+    cycle and the kernel would re-demote forever: classify
+    interactive, kernel demotes, daemon re-classifies interactive, ...
+    """
+    # Housekeeping: seen_demotions only needs to cover pids that are
+    # still kernel-managed (an expired pid that reappears comes with a
+    # fresh ts anyway) - keeps the dedup memory bounded.
+    for pid in list(phase2.seen_demotions):
+        if pid not in phase2.kernel_managed:
+            del phase2.seen_demotions[pid]
+    for entry in dump_map_entries(PIN_DEMOTIONS, "demotions dump"):
+        if exit_requested:
+            break  # same signal discipline as reconcile's task loops
+        parsed = _parse_demotion_entry(entry)
+        if parsed is None:
+            raw_key = parse_hex_field(entry, "key", "demotions dump")
+            raw_val = parse_hex_field(entry, "value", "demotions dump")
+            log("BEHAVIOR DEMOTION: contract violation (key %s, value "
+                "%s); deleting the raw entry WITHOUT adopting it"
+                % (raw_key.hex(), raw_val.hex()))
+            _delete_demotion(raw_key, "demotions delete (raw entry)")
+            continue
+        pid, ts_ns, from_cls, to_cls, streak, raw_key = parsed
+        if phase2.seen_demotions.get(pid) == ts_ns:
+            # Same event as before (its delete failed and the kernel
+            # has not written a new one): retry the delete, no
+            # duplicate announcement.
+            _delete_demotion(raw_key, "demotions delete (pid=%d)" % pid)
+            continue
+        # The mandated one line per event. ts_ns is printed exactly as
+        # the kernel recorded it - its clock domain is the kernel's
+        # choice and must not be reinterpreted here. Class names
+        # render the canonical case as the exact contract text
+        # "interactive -> batch"; an unexpected class value is still
+        # printed truthfully rather than misnamed.
+        log("BEHAVIOR DEMOTION: pid %d exhausted %d consecutive slices "
+            "as %s -> %s (kernel-authoritative at %d)"
+            % (pid, streak,
+               CLASS_NAMES.get(from_cls, "class %d" % from_cls),
+               CLASS_NAMES.get(to_cls, "class %d" % to_cls), ts_ns))
+        phase2.kernel_managed.add(pid)
+        phase2.seen_demotions[pid] = ts_ns
+        _delete_demotion(raw_key, "demotions delete (pid=%d)" % pid)
+
+
+def run_knob_cycle(phase2):
+    """Phase 2 adaptive-knob controller: one invocation per loop pass.
+    (1) once per scheduler instance, adopt the live knob value
+    (read-only); (2) read stats; (3) turn counter deltas into per-lane
+    enqueue rates over the MEASURED wall time since the last read;
+    (4) feed the EWMA/hysteresis machine; (5) execute at most ONE knobs
+    read-modify-write when it fires - there are no other knob writes.
+    """
+    if exit_requested:
+        return
+    phase2.cycles += 1
+    if not phase2.knob.synced:
+        got = read_knobs("knobs adoption read")
+        if got is None:
+            # Absent or not contract-shaped: latch writes off for this
+            # run (classification is unaffected) rather than guess.
+            phase2.writes_disabled = True
+            log("knobctl: no contract-shaped knobs[0] to adopt; knob "
+                "writes are DISABLED this run")
+        else:
+            phase2.knob.adopt(got[0][0])
+            log("knobctl: adopted live interactive_slice_ns=%d from "
+                "knobs[0] (read-only, no write)" % got[0][0])
+    counters = read_stats_counters()
+    now = time.monotonic()
+    if phase2.last_stats is None or phase2.last_stats_at is None:
+        # First read for this scheduler instance: baseline only, no
+        # rate exists yet. The warmup observations start next cycle.
+        phase2.last_stats = counters
+        phase2.last_stats_at = now
+        log("knobctl: stats baseline set (interactive=%d batch=%d); "
+            "%d-observation warmup starts next cycle"
+            % (counters.get(CLASS_INTERACTIVE, 0),
+               counters.get(CLASS_BATCH, 0), KNOB_WARMUP_SAMPLES))
+        return
+    # MEASURED interval, never the nominal 2s: an offset-recheck pass
+    # runs a probe pair with a 6s poll window, and a large demotion
+    # backlog stretches a pass too - dividing those deltas by 2.0 would
+    # overstate the rate up to ~4x and could fire the hot rule on a
+    # perfectly quiet system.
+    interval = now - phase2.last_stats_at
+    if interval <= 0:
+        interval = LOOP_INTERVAL_S  # monotonic misbehavior: nominal cadence
+    delta_i = (counters.get(CLASS_INTERACTIVE, 0)
+               - phase2.last_stats.get(CLASS_INTERACTIVE, 0))
+    delta_b = (counters.get(CLASS_BATCH, 0)
+               - phase2.last_stats.get(CLASS_BATCH, 0))
+    phase2.last_stats = counters
+    phase2.last_stats_at = now
+    if delta_i < 0 or delta_b < 0:
+        # u64 enqueue counters never decrease: a negative delta means
+        # the stats map was reset or replaced underneath us (a
+        # scheduler restart the map-id check has not seen yet, or a
+        # reload of the stats map alone). Re-baseline and restart the
+        # warmup rather than feed a nonsense negative rate into the
+        # EWMA - same discipline as the map-id reset, self-triggered.
+        log("knobctl: stats counters regressed (interactive delta=%d, "
+            "batch delta=%d); re-baselining, warmup restarts"
+            % (delta_i, delta_b))
+        phase2.knob.reset()
+        return
+    rate_i = delta_i / interval
+    rate_b = delta_b / interval
+    action = phase2.knob.observe(rate_i)
+    # Visibility: one line every ~30s, once when warmup completes, and
+    # on every rule firing - enough to watch the controller work in
+    # acceptance without per-cycle noise (the daemon prints changes).
+    if (action is not None
+            or phase2.cycles % KNOB_STATUS_EVERY == 0
+            or phase2.knob.samples == KNOB_WARMUP_SAMPLES + 1):
+        warm = ("warming %d/%d" % (phase2.knob.samples,
+                                   KNOB_WARMUP_SAMPLES)
+                if phase2.knob.samples <= KNOB_WARMUP_SAMPLES
+                else "armed")
+        log("knobctl: cycle %d: enqueue rates interactive=%.1f/s "
+            "batch=%.1f/s; EWMA interactive=%.1f/s (%s); "
+            "interactive_slice_ns=%d%s"
+            % (phase2.cycles, rate_i, rate_b, phase2.knob.ewma, warm,
+               phase2.knob.slice_ns,
+               "; knob writes DISABLED (ABI mismatch)"
+               if phase2.writes_disabled else ""))
+    if action is None:
+        return
+    rule, target, streak, ewma = action
+    if phase2.writes_disabled:
+        if not phase2.disabled_announced:
+            phase2.disabled_announced = True
+            log("knobctl: %s rule fired (EWMA %.1f/s, %d consecutive "
+                "cycles) but knob writes are disabled this run; later "
+                "firings stay silent" % (rule, ewma, streak))
+        return
+    if write_knob_interactive_slice(target):
+        old = phase2.knob.slice_ns
+        phase2.knob.apply(target)
+        # The ONE explainable line per actual change (Phase 2 rule):
+        # old value, new value, the EWMA number, the rule that fired,
+        # and the consecutive-cycle count. Nothing else is printed.
+        log("knobctl: interactive_slice_ns %d -> %d (EWMA interactive "
+            "rate %.1f/s; %s rule: %s for %d consecutive cycles)"
+            % (old, target, ewma, rule,
+               ("EWMA > %.0f/s" % KNOB_HOT_RATE) if rule == "hot"
+               else ("EWMA < %.0f/s" % KNOB_COOL_RATE), streak))
+    # else: write_knob_interactive_slice already logged the failure and
+    # the belief is unchanged, so the rule re-fires and retries next
+    # cycle while its conditions still hold.
 
 
 # ---------------------------------------------------------------------------
@@ -1005,7 +1641,13 @@ def preflight():
         die(5, "preflight",
             "not running as root (euid=%d); the pinned maps under %s "
             "are root-owned" % (os.geteuid(), PIN_DIR))
-    for pin in (PIN_TASK_CLASS, PIN_PID_PROBE):
+    # Phase 2: the controller and the demotion listener add three
+    # pinned maps to the contract (stats, knobs, demotions). Preflight
+    # demands ALL five with the same "is the scheduler running?"
+    # discipline (exit 2): a Phase 1-only scheduler must be refused
+    # outright, not quietly half-driven by a Phase 2 daemon.
+    for pin in (PIN_TASK_CLASS, PIN_PID_PROBE,
+                PIN_STATS, PIN_KNOBS, PIN_DEMOTIONS):
         if not os.path.exists(pin):
             die(2, "preflight",
                 "pin %s does not exist - is the scheduler running? "
@@ -1015,6 +1657,8 @@ def preflight():
                 "'nsenter -t $(pgrep -x foresight_sched) -m -- python3 "
                 "foresight_daemon.py')" % pin)
     log("preflight: pins present: %s, %s" % (PIN_TASK_CLASS, PIN_PID_PROBE))
+    log("preflight: Phase 2 pins present: %s, %s, %s"
+        % (PIN_STATS, PIN_KNOBS, PIN_DEMOTIONS))
     locate_bpftool()
     swept = sweep_stale_probes()
     if swept:
@@ -1062,7 +1706,12 @@ def main():
     # other bpftool failure that stops the daemon.
     try:
         initial_ids = {}
-        for pin in (PIN_TASK_CLASS, PIN_PID_PROBE):
+        # Phase 2: the restart detector now watches all FIVE contract
+        # pins - a restart replaces every map object, and the Phase 2
+        # bookkeeping (EWMA baseline, knob belief, kernel_managed) must
+        # be reset together with the classification state when it does.
+        for pin in (PIN_TASK_CLASS, PIN_PID_PROBE,
+                    PIN_STATS, PIN_KNOBS, PIN_DEMOTIONS):
             initial_ids[pin] = _show_map_id(pin, "preflight map id")
     except DaemonError as exc:
         if not pins_exist():
@@ -1107,6 +1756,14 @@ def main():
     pass_count = 0   # loop passes since start (drives offset rechecks)
     recheck_fails = 0
 
+    # Phase 2 state in one object (so a detected scheduler restart can
+    # reset it atomically): the adaptive-knob controller plus the
+    # behavior-demotion listener's kernel_managed skip set. Both run
+    # inside the loop's existing try block below and inherit its
+    # exception ladder unchanged: SchedulerGone -> clean exit 0,
+    # DaemonError -> fail_streak -> exit 10. No new exit codes.
+    phase2 = Phase2State()
+
     try:
         while not exit_requested:
             # The pin check IS the scheduler-alive check (pin lifecycle
@@ -1148,8 +1805,28 @@ def main():
                             % (offset, new_offset, len(state)))
                         offset = new_offset
             try:
-                check_map_ids(initial_ids, state, failcount, abandoned)
-                reconcile(rules, offset, state, failcount, abandoned)
+                # Maintainer fix (Phase 2 acceptance forensics): the five
+                # `map show` calls in check_map_ids cost ~0.5-3.5s EACH
+                # under CPU load (bpftool children compete in the batch
+                # lane with the very hogs the kernel demoted there),
+                # making every pass 10-30s. Gate the liveness sweep to
+                # every 5th pass: restart detection gains a few passes
+                # of latency; the pins check at loop top still catches
+                # the common case instantly.
+                if pass_count % MAP_ID_CHECK_PASSES == 0:
+                    check_map_ids(initial_ids, state, failcount, abandoned,
+                                  phase2)
+                # Phase 2 listener BEFORE reconcile: events drained
+                # this cycle must gate THIS cycle's classification
+                # writes - otherwise a freshly-demoted pid is
+                # re-classified interactive one full cycle before the
+                # skip applies.
+                drain_demotions(phase2)
+                reconcile(rules, offset, state, failcount, abandoned,
+                          phase2.kernel_managed)
+                # Phase 2 adaptive-knob controller: stats -> rates ->
+                # EWMA -> hysteresis -> at most one knobs RMW write.
+                run_knob_cycle(phase2)
                 poll_test_children(children)
                 fail_streak = 0
             except SchedulerGone:
@@ -1157,6 +1834,14 @@ def main():
                     "exiting cleanly")
                 return 0
             except DaemonError as exc:
+                # Maintainer fix: fail fast when the scheduler died
+                # mid-pass (observed live: rc=255 bpftool errors against
+                # vanished pins, then up to 10 slow retries before the
+                # give-up). The pins check is cheap; consult it first.
+                if not pins_exist():
+                    log("scheduler pins vanished - the scheduler stopped; "
+                        "exiting cleanly")
+                    return 0
                 fail_streak += 1
                 if fail_streak >= LOOP_FAIL_GIVEUP:
                     die(10, "classification loop",
@@ -1165,6 +1850,10 @@ def main():
                 log("loop pass failed (%d/%d): %s; will retry"
                     % (fail_streak, LOOP_FAIL_GIVEUP, exc))
             except Exception as exc:  # never crash on anything
+                if not pins_exist():
+                    log("scheduler pins vanished - the scheduler stopped; "
+                        "exiting cleanly")
+                    return 0
                 fail_streak += 1
                 if fail_streak >= LOOP_FAIL_GIVEUP:
                     die(10, "classification loop",

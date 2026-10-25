@@ -49,10 +49,12 @@ never proprietary hardware.
 
 ## The long run — what we hope to achieve
 
-> **Status (Oct 23, 2026): Phase 0 ✅ COMPLETE — including the 28.0h soak
+> **Status (Oct 25, 2026): Phase 0 ✅ COMPLETE — including the 28.0h soak
 > (573,624 scheduling decisions, zero anomalies, zero panics, clean unload
 > at the end) · Phase 1 ✅ core shipped (live classification loop proven
-> on the real kernel) · full receipts in
+> on the real kernel) · Phase 2 ✅ core shipped (kernel behavior demotion +
+> adaptive knobs; hot rule fired live — see
+> [PHASE-2-REPORT.md](PHASE-2-REPORT.md)) · full receipts in
 > [PHASE-0-1-REPORT.md](PHASE-0-1-REPORT.md)**
 
 **Phase 0 — Prove the loop (now ✅, Oct 21 2026; soak gate closed Oct 23).**
@@ -70,12 +72,19 @@ lanes) — fed by Foresight's classifier over a shared map.
 *Done when: mixed workload shows measurably better interactive latency
 than the default scheduler, with batch throughput within 10%.*
 
-**Phase 2 — Telemetry-driven self-tuning.**
+**Phase 2 — Telemetry-driven self-tuning (✅ core shipped, Oct 25 2026).**
 EWMA baselines and anomaly signals (the Foresight anomaly engine)
 dynamically reweight policy knobs: the scheduler adapts to *this*
 machine's workload rhythm instead of static profiles.
 *Done when: policy weights visibly adapt within a session and the
 adaptation is logged and explainable.*
+**✅ RECEIPTS: kernel behavior demotion fired live (5 explainable,
+kernel-authoritative events); adaptive knob fired live —
+`interactive_slice_ns 20ms -> 10ms (EWMA 72.3/s; hot rule: >50/s for 3
+consecutive cycles)`, visible in the live knobs map; sticky-offset drift
+repair live; rate math matches scheduler counters exactly. See
+[PHASE-2-REPORT.md](PHASE-2-REPORT.md) — including the lane-contention
+semantic finding that calibrates Phase 4.**
 
 **Phase 3 — Energy-aware variant.**
 On battery, bias the same policy toward efficiency (batch deferral,

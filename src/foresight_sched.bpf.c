@@ -84,6 +84,40 @@
  *  6. No other global mutable state exists in this file: two maps, the
  *     UEI exit-info record, and nothing else. No loops, no recursion,
  *     no dynamic allocation anywhere.
+ *
+ * PHASE 2 ADDITION - the behavior engine (every Phase 0/1 code path
+ * and comment above is preserved verbatim; the counts in older items
+ * describe the phase they were written in).
+ * =================================================================
+ * Phase 2 teaches the kernel to detect interactive-CLASSIFIED tasks
+ * that BEHAVE like CPU hogs: every classified task's enqueue-to-
+ * enqueue interval is judged "burned a full slice" when it lands in
+ * [slice_ns/2, 3*slice_ns/2); N consecutive such intervals (N =
+ * knobs.demote_streak, daemon-tunable at runtime) rewrite
+ * task_class[pid] to TASK_CLASS_BATCH and log one explainable
+ * demotion_event. New state beyond the maps above: task_meta
+ * (per-pid streak), knobs (tunables), demotions (event log).
+ *
+ *  7. The engine's clock is bpf_ktime_get_ns() (CLOCK_MONOTONIC ns):
+ *     the shared contract names it; it is the very helper that
+ *     scx/compat.bpf.h falls back to when defining scx_bpf_now();
+ *     and its clock domain matches the Python daemon's
+ *     time.monotonic_ns() for interpreting demotion timestamps.
+ *     Only same-clock deltas are ever compared, so any monotonic
+ *     clock would be correct - this one is simply the plainest.
+ *  8. Only CLASSIFIED tasks run the engine: the unclassified early
+ *     return in foresight_enqueue() is untouched Phase 0/1
+ *     behavior. Demotion requires class == INTERACTIVE, and
+ *     tracking the whole unclassified churn population (every
+ *     short-lived task on the system) would exhaust task_meta's
+ *     8192 slots with dead pids in hours.
+ *  9. A demoted task's CURRENT enqueue still takes (and counts as)
+ *     the interactive lane: tclass was read before the engine ran
+ *     and the map rewrite governs the future only - the contract's
+ *     "the demoted task's NEXT enqueue counts as batch". This
+ *     keeps "stats[class] == enqueues that took that class's lane"
+ *     exactly true; the cost is one final interactive enqueue,
+ *     bounded by one slice.
  */
 
 /*
@@ -141,6 +175,23 @@ enum {
  * value is a single byte, so concurrent userspace updates cannot tear.
  * Map definition shape is the literal BPF_MAP_TYPE_HASH pattern from
  * scx_flatcg.bpf.c (cgv_node_stash).
+ *
+ * PHASE 2 UPDATE (behavior-engine contract): the "this BPF code only
+ * reads it" invariant above ends here - the demotion path in
+ * foresight_enqueue() now also rewrites task_class[pid] to
+ * TASK_CLASS_BATCH for interactive-classified CPU hogs. Kernel and
+ * daemon writes both go through the map's own update path
+ * (bpf_map_update_elem / bpf(BPF_MAP_UPDATE_ELEM)), which serializes
+ * them; the u8 value can never tear and last writer wins. The
+ * daemon's periodic re-classification can therefore re-promote a
+ * kernel-demoted task. The Phase 2.1 gate (reviewer findings 1+3:
+ * task_meta is only looked up/created for INTERACTIVE tasks) is what
+ * makes the next sentence TRUE: during the batch period the engine
+ * never touches the streak, so on re-promotion the stale entry's
+ * first delta lands far outside the window and resets it - the
+ * engine genuinely needs another full demote_streak-length streak
+ * to demote again. Bounded-rate disagreement (one demotion costs
+ * >= demote_streak burned slices), never a kernel-side livelock.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -187,6 +238,125 @@ struct {
 	__type(key, char[16]);		/* TASK_COMM_LEN incl. NUL */
 	__type(value, u32);		/* kernel-global pid at exec time */
 } pid_probe SEC(".maps");
+
+/*
+ * =====================================================================
+ * PHASE 2 (shared contract with Writer E's daemon): the behavior
+ * engine's state - three maps, keyed by the same kernel-global pid
+ * space as task_class, plus one daemon-tunable knob struct. The
+ * loader pins all of task_class/pid_probe/stats/knobs/demotions
+ * under /sys/fs/bpf/foresight for the daemon; task_meta below is
+ * deliberately NOT pinned - it is kernel-private streak state with
+ * no daemon consumer.
+ * =====================================================================
+ */
+
+/*
+ * task_meta - Phase 2 per-task behavior state (contract struct,
+ * verbatim). Keyed by the same kernel-global pid as task_class, so
+ * the two lookups always refer to the same task.
+ *
+ * last_enq_ns doubles as the "have we seen this task before" flag:
+ * 0 means first observation (a ktime of literally 0 is not a real
+ * timestamp). full_slice_streak counts CONSECUTIVE enqueue-to-
+ * enqueue intervals that look like a fully-burned slice (the
+ * [slice/2, 3*slice/2) window in foresight_enqueue()).
+ *
+ * _pad keeps the struct hole-free at exactly 16 bytes: the create
+ * path copies a stack struct into the map and the verifier requires
+ * every copied byte to be initialized - explicit padding is the
+ * contract's way of leaving no implicit tail hole.
+ *
+ * No exit hook purges entries (Phase 2 may not touch ops.exit):
+ * a dead task's entry persists and pid reuse inherits a stale
+ * streak. That is self-healing: the new task's first interval is
+ * almost certainly outside the full-slice window and resets the
+ * streak - and if it is itself a CPU hog, demoting it is defensible
+ * anyway. Phase 2.1 gate (reviewer finding 1): ONLY interactive-
+ * classified tasks run the engine - neither the unclassified churn
+ * population NOR batch/normal tasks (a kernel build's gcc/cc1/make
+ * hordes would otherwise exhaust 8192 slots in hours and silently
+ * switch demotion off for every later task). With the gate the map
+ * tracks only the interactive-classified population - a handful of
+ * concurrent editor/shell/browser threads; 8192 is generous for
+ * that. If it ever fills anyway, the engine degrades gracefully
+ * per the comment in foresight_enqueue.
+ */
+struct task_meta {
+	u64 last_enq_ns;			/* 0 = never enqueued before */
+	u32 full_slice_streak;			/* consecutive full slices */
+	u32 _pad;				/* hole-free: 16 bytes total */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);		/* per Phase 2 contract */
+	__type(key, u32);			/* pid of the task */
+	__type(value, struct task_meta);
+} task_meta SEC(".maps");
+
+/*
+ * knobs - Phase 2 runtime-tunable parameters (contract struct,
+ * verbatim), rewritten at will by the daemon through the pinned
+ * file. ARRAY of 1 so a single key-0 lookup reads the whole struct;
+ * both slices and the demotion threshold live in one value so one
+ * update atomically reconfigures the engine (see the concurrency
+ * note in foresight_enqueue for the field-level view).
+ *
+ * The loader seeds knobs[0] = { SCX_SLICE_DFL, SCX_SLICE_DFL, 10,
+ * 0 } right after load and BEFORE attach: ARRAY maps start zeroed,
+ * and a 0ns slice would be catastrophic. Defense in depth (also
+ * contract): the BPF side independently falls back to SCX_SLICE_DFL
+ * when the knobs lookup fails or a slice field is 0, and skips
+ * demotion entirely while demote_streak is 0 - the never-seeded
+ * state. _pad keeps the 24-byte struct hole-free for the same
+ * verifier reason as task_meta.
+ */
+struct sched_knobs {
+	u64 interactive_slice_ns;		/* 0 -> SCX_SLICE_DFL fallback */
+	u64 batch_slice_ns;			/* 0 -> SCX_SLICE_DFL fallback */
+	u32 demote_streak;			/* 0 -> demotion disabled */
+	u32 _pad;				/* hole-free: 24 bytes total */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);			/* per Phase 2 contract */
+	__type(key, u32);			/* always 0 */
+	__type(value, struct sched_knobs);
+} knobs SEC(".maps");
+
+/*
+ * demotions - Phase 2 explainability log (contract struct, verbatim):
+ * one entry per demoted pid, the human-readable "why" of a kernel
+ * demotion. Inserted with BPF_ANY, so a repeat demotion of the same
+ * pid overwrites its previous event ("last demotion wins" - this is
+ * a 256-slot mailbox, not a ring); if 256 distinct demoted pids
+ * accumulate, further events are dropped while the demotions
+ * themselves still happen.
+ *
+ * from_class/to_class are recorded explicitly (not just "it
+ * changed") so the daemon can distinguish a kernel demotion 1->2
+ * from any daemon-side re-classification, and streak carries the
+ * threshold-satisfying streak count. Layout note: the members fill
+ * 12 of the 16 value bytes; the insert site zero-fills the whole
+ * struct ("= {}") so the alignment tail padding is always
+ * initialized - the verifier requires every byte copied into a
+ * map to be.
+ */
+struct demotion_event {
+	u64 ts_ns;				/* bpf_ktime_get_ns() at demotion */
+	u8 from_class;				/* TASK_CLASS_INTERACTIVE (1) */
+	u8 to_class;				/* TASK_CLASS_BATCH (2) */
+	u16 streak;				/* streak that fired this event */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);		/* per Phase 2 contract */
+	__type(key, u32);			/* pid of the demoted task */
+	__type(value, struct demotion_event);
+} demotions SEC(".maps");
 
 /*
  * Tracepoint probe: runs in the context of the exec'ing task, so
@@ -284,12 +454,53 @@ s32 BPF_STRUCT_OPS(foresight_select_cpu, struct task_struct *p, s32 prev_cpu,
  * while the secondary lane remains a plain global FIFO - the same
  * behavior scx_simple gives every task. The stats key for both default
  * flavors is 0 ("normal") per spec.
+ *
+ * PHASE 2 ADDITION (behavior engine, shared contract): after the
+ * class lookup and before every dsq insert below, this callback
+ * also:
+ *   1. reads knobs[0] for the lane slices and the demotion
+ *      threshold, falling back to SCX_SLICE_DFL / demotion-off on
+ *      a missing entry or zero fields (never-seeded safety);
+ *   2. maintains task_meta[pid]: the enqueue-to-enqueue interval
+ *      is judged "full slice burned" when within
+ *      [slice_ns/2, 3*slice_ns/2), tracking the consecutive
+ *      streak (yielded-early or blocked resets it to 0);
+ *   3. demotes an INTERACTIVE task whose streak reaches
+ *      knobs.demote_streak: rewrites task_class[pid] to BATCH
+ *      (the kernel writing the same HASH map userspace writes -
+ *      both serialize through the map update path, u8 cannot
+ *      tear) and logs a demotion_event.
+ *
+ * The unclassified early return below deliberately does NOT run
+ * the engine: demotion requires an interactive classification,
+ * and per-task state for the whole unclassified churn population
+ * would exhaust task_meta (file-header judgment call 8). Explicit
+ * class 0 DOES run it: it keeps the knob-driven batch slice (its
+ * lane is the batch lane) but can never demote - the demotion
+ * check requires TASK_CLASS_INTERACTIVE.
  */
 void BPF_STRUCT_OPS(foresight_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	u32 pid = p->pid;			/* map key; qmap does the same */
 	u8 *class_p;
 	u8 tclass;
+	/*
+	 * PHASE 2 (shared contract) locals. kzero is the knobs ARRAY
+	 * key (always 0). islice/bslice/demote_at pre-load the safe
+	 * fallbacks so a failed knobs lookup or a zero field leaves
+	 * the Phase 0/1 defaults in force; slice_ns is the lane slice
+	 * every dsq insert below uses; now is this enqueue's
+	 * bpf_ktime_get_ns() timestamp, shared by the interval math
+	 * and the demotion event.
+	 */
+	u32 kzero = 0;
+	u64 islice = SCX_SLICE_DFL;		/* knob or built-in default */
+	u64 bslice = SCX_SLICE_DFL;		/* knob or built-in default */
+	u32 demote_at = 0;			/* 0 = demotion disabled */
+	u64 slice_ns;				/* this task's lane slice */
+	u64 now;				/* this enqueue's timestamp */
+	struct sched_knobs *knobs_p;
+	struct task_meta *meta_p;
 
 	/* May miss - that is the normal "unclassified task" case. */
 	class_p = bpf_map_lookup_elem(&task_class, &pid);
@@ -297,6 +508,12 @@ void BPF_STRUCT_OPS(foresight_enqueue, struct task_struct *p, u64 enq_flags)
 		/*
 		 * Lookup failed: safe default path (scx_simple's enqueue
 		 * behavior), stat key 0 per spec.
+		 *
+		 * PHASE 2 note: this branch never runs the behavior
+		 * engine (demotion needs class == INTERACTIVE, and
+		 * per-task state for the unclassified churn population
+		 * would exhaust task_meta) - it stays the bit-for-bit
+		 * Phase 0/1 path, including the built-in SCX_SLICE_DFL.
 		 */
 		stat_inc(TASK_CLASS_NORMAL);
 		scx_bpf_dsq_insert(p, BATCH_DSQ, SCX_SLICE_DFL, enq_flags);
@@ -306,23 +523,199 @@ void BPF_STRUCT_OPS(foresight_enqueue, struct task_struct *p, u64 enq_flags)
 	/* Read the byte once; the branches below use this stable copy. */
 	tclass = *class_p;
 
+	/*
+	 * PHASE 2 (shared contract): the behavior engine. now is taken
+	 * as early as possible - it is both the END of the previous
+	 * interval and the START of this one.
+	 *
+	 * bpf_ktime_get_ns() is CLOCK_MONOTONIC: monotonic clocks
+	 * never step backwards, so the delta below cannot wrap in
+	 * practice; and if some clock pathology ever did make it wrap,
+	 * the huge delta lands far outside the full-slice window and
+	 * simply resets the streak. Every failure direction of the
+	 * time math is the safe one.
+	 */
+	now = bpf_ktime_get_ns();
+
+	/*
+	 * PHASE 2.1 GATE (reviewer 4a findings 1+3): the behavior
+	 * engine runs ONLY for INTERACTIVE-classified tasks. meta_p
+	 * stays NULL for batch/normal tasks, so (a) they never create
+	 * entries - a compile-heavy workload's gcc/cc1/make churn
+	 * cannot exhaust task_meta, and demotion stays on for the
+	 * interactive tasks that need it - and (b) a kernel-demoted
+	 * task does not accumulate streak during its batch period,
+	 * so a daemon re-promotion genuinely needs a fresh full
+	 * streak before any re-demotion (the header claim, now
+	 * enforced by this gate rather than asserted).
+	 *
+	 * Create-on-miss for the interactive population: BPF_NOEXIST
+	 * then re-lookup - the exact scx_flatcg fcg_cgroup_init()
+	 * cgv_node_stash pattern. NOEXIST means a lost create race
+	 * can never zero out another CPU's fresh entry; the zeroed
+	 * `fresh` is the contract's "zero-initialized on insert",
+	 * and a fully-initialized stack source is what the verifier
+	 * requires for a map copy.
+	 */
+	meta_p = NULL;
 	if (tclass == TASK_CLASS_INTERACTIVE) {
-		/* Priority lane, consumed first by foresight_dispatch(). */
+		meta_p = bpf_map_lookup_elem(&task_meta, &pid);
+		if (!meta_p) {
+			struct task_meta fresh = {};
+
+			bpf_map_update_elem(&task_meta, &pid, &fresh,
+					    BPF_NOEXIST);
+			meta_p = bpf_map_lookup_elem(&task_meta, &pid);
+		}
+	}
+
+	/*
+	 * PHASE 2 (shared contract): knobs lookup - lane slices and
+	 * the demotion threshold. The loader seeds knobs[0] right
+	 * after load (before attach); the daemon rewrites it at
+	 * runtime through the pin. The lookup is ARRAY key 0 so it
+	 * cannot miss in practice, but the null check plus the
+	 * pre-loaded SCX_SLICE_DFL / demotion-off defaults above are
+	 * the contract's never-seeded safety net: a zero slice would
+	 * be catastrophic, so any knob we cannot vouch for degrades to
+	 * the Phase 0/1 defaults.
+	 *
+	 * Concurrency: a daemon rewrite replaces the whole 24-byte
+	 * value with one memcpy; each field we read is one aligned
+	 * 8/4-byte load, so we can at worst see old/new values of
+	 * DIFFERENT fields in a single enqueue - never a garbled
+	 * field, and no invariant couples the three fields. Fields
+	 * are read once into locals; the code below uses these
+	 * stable copies (same discipline as tclass above).
+	 */
+	knobs_p = bpf_map_lookup_elem(&knobs, &kzero);
+	if (knobs_p) {
+		if (knobs_p->interactive_slice_ns)
+			islice = knobs_p->interactive_slice_ns;
+		if (knobs_p->batch_slice_ns)
+			bslice = knobs_p->batch_slice_ns;
+		/* 0 also covers the never-seeded state: engine off. */
+		demote_at = knobs_p->demote_streak;
+	}
+
+	/*
+	 * This task's lane slice: interactive lane -> interactive
+	 * slice, everything else (batch, explicit class 0) -> batch
+	 * slice. The unclassified early return above keeps the
+	 * built-in SCX_SLICE_DFL: it never runs the engine at all, so
+	 * the Phase 0 "safe default path copies scx_simple" guarantee
+	 * stays bit-for-bit true for it.
+	 */
+	slice_ns = tclass == TASK_CLASS_INTERACTIVE ? islice : bslice;
+
+	if (meta_p) {
+		if (meta_p->last_enq_ns) {
+			u64 delta = now - meta_p->last_enq_ns;
+			u64 half = slice_ns / 2;
+
+			/*
+			 * Full-slice window [slice_ns/2, 3*slice_ns/2)
+			 * (contract): a task that burns its entire slice
+			 * is back roughly slice_ns later - it ran the
+			 * full slice, then immediately became runnable
+			 * again. One that yields early is back in under
+			 * half a slice; one that blocked (I/O, sleep) is
+			 * back after 1.5+ slices. The window tolerates
+			 * +/-50% queueing jitter around the slice.
+			 *
+			 * The upper bound is written as slice_ns + half,
+			 * identical to slice_ns * 3 / 2 for every value
+			 * (s + floor(s/2) == floor(3s/2)) but immune to
+			 * the multiply overflow an absurd daemon-written
+			 * slice could cause: a wrapped bound can only
+			 * EMPTY the window (engine off, safe), never
+			 * widen it. Preemption mid-slice (SCX_ENQ_REENQ)
+			 * shrinks delta below the window and resets the
+			 * streak - the engine under-detects rather than
+			 * over-detects, the safe direction.
+			 */
+			if (delta >= half && delta < slice_ns + half)
+				meta_p->full_slice_streak++;
+			else
+				meta_p->full_slice_streak = 0;
+		}
+		/* else: first observation - streak stays 0 (contract). */
+		meta_p->last_enq_ns = now;
+
+		/*
+		 * Single-writer note (races): ops.enqueue runs under the
+		 * enqueued task's rq lock and a task is queued-or-
+		 * running, never both, so one pid's enqueues are
+		 * strictly serialized - the non-atomic streak++ above
+		 * can never race with itself. task_meta is keyed by pid,
+		 * so distinct tasks touch distinct entries.
+		 *
+		 * DEMOTION (contract): interactive-classified task whose
+		 * streak just reached the daemon-set threshold. Order
+		 * matters: rewrite task_class[pid] to BATCH, reset the
+		 * streak, then log the event carrying the PRE-reset
+		 * streak. The u16 event field can only truncate if the
+		 * daemon sets a threshold above 65535 - streak_before is
+		 * always <= the threshold, since the streak resets at
+		 * every demotion.
+		 *
+		 * This enqueue keeps its already-read tclass, so it
+		 * still takes (and counts as) the interactive lane: the
+		 * rewritten map governs the NEXT enqueue, which reads
+		 * class 2 and counts as batch - exactly the contract's
+		 * "the demoted task's NEXT enqueue counts as batch", and
+		 * lane and stats counter stay consistent. The demotions
+		 * insert uses BPF_ANY: overwriting an earlier event for
+		 * the same pid is fine ("last demotion wins" mailbox);
+		 * if the 256-slot map is full the event is dropped while
+		 * the demotion itself stands - telemetry never fails an
+		 * enqueue, so no error path and no scx_bpf_error() here.
+		 */
+		if (tclass == TASK_CLASS_INTERACTIVE && demote_at &&
+		    meta_p->full_slice_streak >= demote_at) {
+			u16 streak_before = (u16)meta_p->full_slice_streak;
+			u8 bclass = TASK_CLASS_BATCH;
+			struct demotion_event ev = {};
+
+			bpf_map_update_elem(&task_class, &pid, &bclass,
+					    BPF_ANY);
+			meta_p->full_slice_streak = 0;
+			ev.ts_ns = now;
+			ev.from_class = TASK_CLASS_INTERACTIVE;
+			ev.to_class = TASK_CLASS_BATCH;
+			ev.streak = streak_before;
+			bpf_map_update_elem(&demotions, &pid, &ev, BPF_ANY);
+		}
+	}
+	/*
+	 * else (task_meta full or create failed): telemetry-only
+	 * degradation - the knob-driven slice above still applies;
+	 * tracking and demotion are off for this task. Never fail an
+	 * enqueue over telemetry state.
+	 */
+
+	if (tclass == TASK_CLASS_INTERACTIVE) {
+		/* Priority lane, consumed first by foresight_dispatch().
+		 * Phase 2: knob-driven slice (slice_ns, from knobs above). */
 		stat_inc(TASK_CLASS_INTERACTIVE);
-		scx_bpf_dsq_insert(p, INTERACTIVE_DSQ, SCX_SLICE_DFL,
+		scx_bpf_dsq_insert(p, INTERACTIVE_DSQ, slice_ns,
 				   enq_flags);
 	} else if (tclass == TASK_CLASS_BATCH) {
-		/* Secondary lane. */
+		/* Secondary lane. Phase 2: knob-driven slice. */
 		stat_inc(TASK_CLASS_BATCH);
-		scx_bpf_dsq_insert(p, BATCH_DSQ, SCX_SLICE_DFL, enq_flags);
+		scx_bpf_dsq_insert(p, BATCH_DSQ, slice_ns, enq_flags);
 	} else {
 		/*
 		 * class 0 (normal), or a value userspace should never have
 		 * written: fail closed into the safe default path - same
 		 * queue and same stat key as the lookup-miss branch above.
+		 * Phase 2: this branch DOES run the engine above (the task
+		 * carries an explicit classification), so it gets the
+		 * knob-driven batch slice - its lane is the batch lane;
+		 * demotion can never fire here (class != INTERACTIVE).
 		 */
 		stat_inc(TASK_CLASS_NORMAL);
-		scx_bpf_dsq_insert(p, BATCH_DSQ, SCX_SLICE_DFL, enq_flags);
+		scx_bpf_dsq_insert(p, BATCH_DSQ, slice_ns, enq_flags);
 	}
 }
 

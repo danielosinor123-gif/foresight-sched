@@ -265,7 +265,9 @@ struct {
  * _pad keeps the struct hole-free at exactly 16 bytes: the create
  * path copies a stack struct into the map and the verifier requires
  * every copied byte to be initialized - explicit padding is the
- * contract's way of leaving no implicit tail hole.
+ * contract's way of leaving no implicit tail hole. (The _pad field
+ * itself is never read; the Phase 3.5 duty knob lives in the knobs
+ * map, not here.)
  *
  * No exit hook purges entries (Phase 2 may not touch ops.exit):
  * a dead task's entry persists and pid reuse inherits a stale
@@ -309,14 +311,19 @@ struct {
  * contract): the BPF side independently falls back to SCX_SLICE_DFL
  * when the knobs lookup fails or a slice field is 0, and skips
  * demotion entirely while demote_streak is 0 - the never-seeded
- * state. _pad keeps the 24-byte struct hole-free for the same
- * verifier reason as task_meta.
+ * state. batch_duty_pct (Phase 3.5, occupying the former _pad slot:
+ * same offset and width, so the 24-byte layout and every external
+ * ABI are unchanged) keeps the struct hole-free and drives the
+ * Phase 3 duty-window gate on BATCH_DSQ consumption: 0 = unlimited
+ * (loader seed / PERFORMANCE mode), 1-99 = the batch lane is served
+ * only during that percentage of each 100ms duty window (CONSERVE),
+ * >= 100 is clamped off. Seed 0 doubles as the never-seeded fallback.
  */
 struct sched_knobs {
 	u64 interactive_slice_ns;		/* 0 -> SCX_SLICE_DFL fallback */
 	u64 batch_slice_ns;			/* 0 -> SCX_SLICE_DFL fallback */
 	u32 demote_streak;			/* 0 -> demotion disabled */
-	u32 _pad;				/* hole-free: 24 bytes total */
+	u32 batch_duty_pct;			/* 0 = unlimited; hole-free 24B */
 };
 
 struct {
@@ -731,11 +738,38 @@ void BPF_STRUCT_OPS(foresight_enqueue, struct task_struct *p, u64 enq_flags)
  * If both lanes are empty, returning without consuming is fine: the
  * core keeps the previous task running or idles the CPU and calls
  * dispatch() again later.
+ *
+ * PHASE 3 DUTY-WINDOW GATE (the energy lever, reviewer-endorsed
+ * design): while CONSERVE mode sets batch_duty_pct (1-99), the batch
+ * lane is consumed only during the first duty% of each 100ms window;
+ * for the rest of the window dispatch returns without consuming
+ * BATCH_DSQ, so batch tasks stay queued OFF-CPU - real idle, real
+ * C-states, real drain reduction (NOT total-joules reduction: 25%
+ * power x ~4x wall time is the same energy; the win is survival
+ * until an outlet). Interactive tasks are never gated - the whole
+ * point is that THEY get the machine while batch waits. duty_pct 0
+ * (loader seed / PERFORMANCE) or >= 100 disables the gate; the
+ * window phase derives from monotonic ktime directly (no extra
+ * state), so the gate is three arithmetic ops and verifier-trivial.
  */
 void BPF_STRUCT_OPS(foresight_dispatch, s32 cpu, struct task_struct *prev)
 {
+	u64 now_ns = bpf_ktime_get_ns();
+	u32 kzero = 0;
+	u32 duty = 0;
+	struct sched_knobs *knobs_p = bpf_map_lookup_elem(&knobs, &kzero);
+
+	if (knobs_p)
+		duty = knobs_p->batch_duty_pct;
+	u64 window_ns = 100000000ULL;	/* 100ms duty window */
+
 	/* Priority lane first: interactive tasks never wait on batch. */
 	if (scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ))
+		return;
+
+	/* PHASE 3 duty gate: batch waits outside its serve window. */
+	if (duty && duty < 100
+	    && (now_ns % window_ns) >= window_ns * duty / 100)
 		return;
 
 	/* Secondary lane: batch, normal and unknown tasks. */

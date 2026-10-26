@@ -198,6 +198,113 @@ described a dead instance), a fresh loader-seeded knobs value
 (kernel_managed dies with the old instance; live demoted tasks
 re-register through fresh events).
 
+PHASE 3 (energy-adaptive scheduling) - additive, same loop
+==========================================================
+Implements the "Energy-Adaptive Scheduling" prediction: batch deferral
+under energy pressure, per-process energy accounting (an honest
+CPU-second proxy for joules), and an energy state with hysteresis.
+Network carbon-intensity APIs are OUT of scope (documented future
+hook). Same loop, same signal discipline, same exception ladder - NO
+new exit codes.
+
+1. Battery collector (read_power_sample). /sys/class/power_supply is
+   EMPTY under WSL2 (no passthrough - verified live), so the working
+   path is PowerShell interop. ONE invocation per refresh gathers
+   BOTH CIM sources - root/wmi BatteryStatus (Charging/Discharging/
+   PowerOnline/DischargeRate/ChargeRate; the rates are mW, i.e. REAL
+   power draw) and Win32_Battery (EstimatedChargeRemaining percent) -
+   so the measured ~3.5s interop startup cost is paid once per
+   refresh, not twice. The transport is -EncodedCommand: the script
+   travels as ONE base64 UTF-16LE argv element, so no shell ever
+   re-splits it (the empirically fatal quoting path is powershell.exe
+   -> wsl.exe -> bash: each layer eats one quoting level; Python
+   list-argv subprocess + -EncodedCommand bypasses all of them).
+   EMPIRICAL cross-check on this machine: BOTH power states were
+   observed live and the two sources AGREE - on AC: Discharging=false
+   with Win32_Battery.BatteryStatus=2 ("AC"), DischargeRate=0 and
+   ChargeRate ~27W while charging; discharging: Discharging=true with
+   BatteryStatus=1 ("discharging"), DischargeRate ~21.8-22.8W. The
+   root/wmi Discharging flag is the PRIMARY on-battery signal (direct
+   boolean flags); a disagreement with Win32_Battery is logged once
+   per run and root/wmi is trusted. /sys/class/power_supply is still
+   tried FIRST (zero cost, future-proof for a host that exposes
+   supplies); its parser is best-effort and CANNOT be exercised under
+   WSL2 - an honestly untested path, flagged for the reviewer. JSON
+   shapes are handled defensively: single object OR array (multi-
+   battery hosts) at every level. 10s subprocess timeout; ANY failure
+   degrades to {"present": false} - the state machine treats that as
+   NO EVIDENCE, never a state flip.
+
+2. Energy state machine (EnergyState - pure logic, unit-tested).
+   PERFORMANCE (mains/plugged) vs CONSERVE (discharging). Enter
+   CONSERVE on the first sample that reports discharging (entry
+   latency <= ENERGY_POLL_INTERVAL_S = 30s at the refresh cadence);
+   entry is IMMEDIATE, only EXIT is hysteretic: exit needs 60s of
+   CONTINUOUS mains (at this cadence: two successful mains readings
+   60s apart), so plug jitter cannot flap the batch lane. Any sample
+   that is not a successful mains reading - discharging again, or
+   unavailable/unknown (timed-out PowerShell call, absent battery) -
+   resets the mains streak: absence is not continuity, and staying in
+   CONSERVE is the fail-safe direction (a spurious exit would
+   un-defer batch work under unknown power conditions).
+   --force-conserve pins CONSERVE regardless of power source (the
+   controlled acceptance test runs on AC). The measured state, drain
+   rate (mW, when discharging) and battery percent are exposed on
+   every cycle for the report.
+   OWNERSHIP SPLIT (the Phase 2 interplay, critical):
+   interactive_slice_ns remains owned by the Phase 2 KnobController;
+   EnergyState owns ONLY batch_slice_ns - CONSERVE entry writes
+   5,000,000 ns (5ms), exit restores 20,000,000 ns - through the SAME
+   generalized knobs read-modify-write (knobs_rebuild + the
+   write_knobs_fields body, one bpftool update, one token per byte)
+   and gated by the SAME ABI-mismatch latch (phase2.writes_disabled)
+   as Phase 2: one latch, both phases' fields. The two controllers
+   write sequentially in the one loop thread - no concurrency - and
+   the writes are level-triggered: a failed write keeps the belief,
+   so the correction re-fires on the next refresh (the retry IS the
+   mechanism, as in Phase 2). One explainable log line per knob
+   change: old value, new value, trigger (battery percent, drain mW,
+   state), mode (adaptive/forced); state transitions get one
+   additional context line.
+
+3. Per-process energy accounting (EnergyAccounting - the "joules
+   proxy"). A DEDICATED pass every 10s (monotonic-gated, its own
+   cadence, NOT the 2s loop): read /proc/<pid>/stat utime+stime for
+   every task (clock ticks scaled by os.sysconf('SC_CLK_TCK')), diff
+   against the previous snapshot, rank the top 5 by cpu-sec/min and
+   print one explainable block: pid, comm, cpu-sec/min, share % of
+   the sampled total - and, when CONSERVE with a measured drain, an
+   estimated battery share (drain mW x share), explicitly labelled a
+   proxy, not joules. Tracking is by pid with the comm read at
+   sampling time; vanished pids are skipped (normal /proc churn) and
+   pid reuse is detected via stat's starttime field (a different
+   start time resets that pid's baseline instead of charging the new
+   process with its predecessor's CPU time). /proc top-level entries
+   are task-granular (threads included), same as scan_proc_comms.
+
+4. --energy-probe (measured-delta acceptance hook). Prints ONE
+   compact JSON line every 5s WITHOUT the "foresight_daemon: "
+   prefix, so the line starts with '{' and greps/parses cleanly (all
+   other daemon lines keep the prefix). Fixed key order (the
+   ENERGY_PROBE_KEYS wire contract the maintainer's comparison script
+   parses), null for honestly unknown values:
+     {"mode":"performance","battery_pct":47,"drain_mw":21790,
+      "batch_cpu_sec_per_min":120.31,"interactive_slice_ns":20000000,
+      "batch_slice_ns":5000000}
+   mode is the energy state; battery_pct/drain_mw come from the
+   cached collector sample (drain only when discharging, 0.0 on
+   mains, null when unavailable); batch_cpu_sec_per_min sums the
+   batch lane from /proc stat deltas: the processes the daemon
+   classified batch (its own task_class writebacks) PLUS any
+   UNCLASSIFIED process burning >50% of one core (class 0 lands in
+   BATCH_DSQ by design - verified in foresight_sched.bpf.c, so such a
+   hog IS batch-lane load); kernel behavior-demoted pids are
+   deliberately not special-cased (not daemon writebacks; a demoted
+   hog >50% is caught by the same rule - reviewer note).
+   interactive_slice_ns/batch_slice_ns are read LIVE from knobs[0]
+   per line (the receipt must show the map's truth, not a belief;
+   beliefs only if the read fails or writes are latched off).
+
 HOW TO RUN (WSL2 gotchas found the hard way, empirically)
 =========================================================
 Run INSIDE the WSL2 distro as root, where the scheduler was started:
@@ -244,6 +351,7 @@ SIGINT/SIGTERM -> kill test children, delete our map entries,
 exit 0.
 """
 
+import base64
 import glob
 import json
 import os
@@ -343,6 +451,73 @@ KNOB_COOL_RATE = 25.0
 KNOB_COOL_STREAK = 5
 KNOB_STATUS_EVERY = 15       # one visibility line per ~30s of cycles
 
+# ---------------------------------------------------------------------------
+# PHASE 3 (energy-adaptive scheduling) tuning.
+#
+# Three prediction features, all additive to the same loop:
+#   (1) batch deferral under energy pressure - the CONSERVE state shortens
+#       batch_slice_ns so batch-lane work yields sooner (the BPF engine
+#       reads knobs[0].batch_slice_ns; contract verified by reading
+#       struct sched_knobs in foresight_sched.bpf.c - nothing to change
+#       there, the field was already wired);
+#   (2) per-process energy accounting - an honest CPU-second proxy for
+#       joules: /proc/<pid>/stat utime+stime deltas, ranked per minute;
+#   (3) energy state with hysteresis - PERFORMANCE vs CONSERVE, leaving
+#       CONSERVE only after 60s of CONTINUOUS mains.
+#
+# OWNERSHIP SPLIT (Phase 2 interplay, critical): interactive_slice_ns
+# stays owned by the Phase 2 KnobController; EnergyState owns ONLY
+# batch_slice_ns. Both go through the same generalized read-modify-write
+# (knobs_rebuild + write_knobs_fields) and the SAME ABI-mismatch latch
+# (phase2.writes_disabled) gates both. The writes are sequential in the
+# one loop thread - no concurrency.
+# ---------------------------------------------------------------------------
+
+BATCH_SLICE_DEFAULT = 20000000   # the loader's seed; the CONSERVE-exit value
+BATCH_SLICE_CONSERVE = 5000000   # 5ms: batch defers under energy pressure
+BATCH_DUTY_UNLIMITED = 0         # Phase 3.5: duty gate off (PERFORMANCE)
+BATCH_DUTY_CONSERVE = 25         # Phase 3.5: batch lane served only during
+                                 # the first 25% of each 100ms window while
+                                 # CONSERVE - the instantaneous-drain lever
+                                 # (NOT total joules-to-completion: 25% power
+                                 # x ~4x wall time is the same energy; the
+                                 # win is survival-until-outlet on battery)
+ENERGY_HYSTERESIS_S = 60.0       # continuous mains required to leave CONSERVE
+ENERGY_POLL_INTERVAL_S = 30.0    # battery/AC refresh cadence (MEASURED
+                                 # monotonic, like every rate here); entry
+                                 # latency <= 30s, exit needs 2 consecutive
+                                 # mains samples 60s apart at this cadence
+ENERGY_PS_TIMEOUT_S = 10.0       # per spec: 10s subprocess timeout
+# The interop path is fixed by Windows' layout; powershell.exe (5.1) is
+# always present on Windows, pwsh is NOT - do not "upgrade" this blindly.
+ENERGY_PS_PATH = ("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/"
+                  "powershell.exe")
+ENERGY_ACCOUNT_INTERVAL_S = 10.0  # the joules-proxy pass cadence (its own
+                                  # cadence, separate from the 2s loop)
+ENERGY_ACCOUNT_TOP_N = 5
+# An unclassified task burning more than 50% of one core runs in the batch
+# lane too (class 0 lands in BATCH_DSQ by design - the "safe default" in
+# foresight_sched.bpf.c, verified by reading the source), so it counts
+# toward the probe's batch energy number. One core = 60 cpu-sec/min, so
+# the threshold is 30 cpu-sec/min - cpu-seconds, clk-independent.
+ENERGY_HOG_RATE = 30.0
+ENERGY_PROBE_INTERVAL_S = 5.0     # --energy-probe JSON line cadence
+# Fixed key order of the --energy-probe line: the wire contract the
+# maintainer's comparison script parses. Keys are ALWAYS present; values
+# may be null when honestly unknown.
+ENERGY_PROBE_KEYS = ("mode", "battery_pct", "drain_mw",
+                     "batch_cpu_sec_per_min", "interactive_slice_ns",
+                     "batch_slice_ns")
+# Energy states (strings, so they render directly in the probe line).
+ENERGY_STATE_PERFORMANCE = "performance"
+ENERGY_STATE_CONSERVE = "conserve"
+# The shape of an "unavailable" sample (any failed/unparseable collector
+# run degrades to this; the state machine reads it as NO EVIDENCE).
+ENERGY_SAMPLE_ABSENT = {"present": False, "source": "none",
+                        "on_battery": None, "percent": None,
+                        "drain_mw": None, "cross_check": "unknown",
+                        "win32_battery_status": None}
+
 # knobs value struct (Phase 2 contract, x86-64 raw memory image):
 #   struct { u64 interactive_slice_ns; u64 batch_slice_ns;
 #            u32 demote_streak; u32 _pad; }  -> sizeof 24, natural
@@ -440,6 +615,10 @@ while time.monotonic() < end:
 BPFTOOL = None          # resolved bpftool path (set in preflight)
 exit_requested = False  # set by the SIGINT/SIGTERM handler only
 last_signal = None
+
+# PHASE 3: cached SC_CLK_TCK (resolved lazily by clk_tck(); None until
+# the first call, then never None again).
+_CLK_TCK = None
 
 
 class DaemonError(Exception):
@@ -1040,7 +1219,8 @@ def reconcile(rules, offset, state, failcount, abandoned, kernel_managed=None):
                 "(%s); dropping tracking only" % (gpid, cls, err))
 
 
-def check_map_ids(initial_ids, state, failcount, abandoned, phase2=None):
+def check_map_ids(initial_ids, state, failcount, abandoned, phase2=None,
+                  phase3=None):
     """Detect a scheduler restart that was too fast for the pins check.
 
     A fresh scheduler instance pins NEW map objects; bpftool's map id
@@ -1058,6 +1238,13 @@ def check_map_ids(initial_ids, state, failcount, abandoned, phase2=None):
     cycle), and the fresh demotions map is empty (kernel_managed dies
     with the old instance; still-demoted tasks re-register through
     fresh events).
+
+    PHASE 3 (phase3 given): the fresh loader re-seeded knobs[0], so
+    the energy state machine drops ONLY its batch-slice belief
+    (mark_restart): the next energy cycle re-adopts the live value
+    read-only and re-writes it if the state demands (CONSERVE). Power
+    state is machine-level, not scheduler-level - the hysteresis clock
+    and the /proc accounting baseline deliberately stay.
     """
     changed = None
     for pin, old_id in initial_ids.items():
@@ -1075,6 +1262,10 @@ def check_map_ids(initial_ids, state, failcount, abandoned, phase2=None):
         if phase2 is not None:
             # Phase 2: fresh maps on every axis - see docstring.
             phase2.reset()
+        if phase3 is not None:
+            # PHASE 3: fresh knobs[0] too - re-adopt + re-write if the
+            # energy state demands; see the docstring above.
+            phase3.mark_restart()
 
 
 # ---------------------------------------------------------------------------
@@ -1281,22 +1472,35 @@ def _parse_demotion_entry(entry):
     return pid, ts_ns, from_cls, to_cls, streak, raw_key
 
 
-def knobs_rebuild(raw, new_interactive_slice_ns):
-    """Phase 2 (PURE, unit-tested): the read-modify-write encoding.
+def knobs_rebuild(raw, interactive_ns=None, batch_ns=None, duty_pct=None):
+    """Phase 2 (PURE, unit-tested); PHASE 3 generalization; PHASE 3.5
+    adds the duty parameter (the knobs struct's fourth field, seeded 0
+    = unlimited, repurposed from _pad as batch_duty_pct).
 
     Given the exact 24-byte knobs[0] memory image currently in the
-    map, return that image with interactive_slice_ns replaced and
-    EVERY other field - batch_slice_ns, demote_streak, _pad - copied
-    through bit for bit. Phase 2 v1 owns exactly one field; zeroing or
-    re-packing any other would silently change kernel behavior the
-    daemon has no mandate over. LE "<QQII" is the x86-64 raw memory
-    image of the C struct { u64; u64; u32; u32; } - natural alignment,
-    no holes, sizeof 24 (verified byte for byte in the offline tests).
+    map, return that image with the provided fields replaced - a None
+    argument keeps that field's current bytes. EVERY field not named
+    is copied through bit for bit ("never zero a field you don't
+    own"). Phase 2 v1 owned exactly one field (positional calls
+    knobs_rebuild(raw, new_ns) keep working unchanged); Phase 3's
+    energy state machine reuses the SAME encoding for batch_slice_ns
+    so both owners preserve each other's bytes in a full-struct RMW;
+    Phase 3.5's duty gate uses the fourth field. LE "<QQII" is the
+    x86-64 raw memory image of the C struct { u64; u64; u32; u32; } -
+    natural alignment, no holes, sizeof 24 (verified byte for byte in
+    the offline tests, and against struct sched_knobs in the BPF
+    source).
     """
-    _old_interactive, batch_ns, demote_streak, pad = struct.unpack(
+    old_interactive, old_batch, demote_streak, old_duty = struct.unpack(
         KNOBS_VALUE_FMT, raw)
-    return struct.pack(KNOBS_VALUE_FMT, new_interactive_slice_ns,
-                       batch_ns, demote_streak, pad)
+    if interactive_ns is None:
+        interactive_ns = old_interactive
+    if batch_ns is None:
+        batch_ns = old_batch
+    if duty_pct is None:
+        duty_pct = old_duty
+    return struct.pack(KNOBS_VALUE_FMT, interactive_ns, batch_ns,
+                       demote_streak, duty_pct)
 
 
 def read_knobs(step):
@@ -1321,26 +1525,33 @@ def read_knobs(step):
     return None
 
 
-def write_knob_interactive_slice(new_slice_ns):
-    """Phase 2: the ONLY knobs write in the daemon - a full-struct
-    read-modify-write of knobs[0] with interactive_slice_ns swapped
-    (batch_slice_ns, demote_streak and _pad ride along untouched, via
-    knobs_rebuild). Returns True only on a confirmed bpftool success.
+def write_knobs_fields(interactive_ns=None, batch_ns=None, duty_pct=None,
+                       step="knobs RMW"):
+    """PHASE 3: the ONE knobs write in the daemon, generalized - a
+    full-struct read-modify-write of knobs[0] replacing ONLY the
+    fields passed (interactive_ns, batch_ns, duty_pct; every other
+    field rides along untouched via knobs_rebuild). Phase 2's adaptive-knob
+    controller calls this for interactive_slice_ns, Phase 3's energy
+    state machine for batch_slice_ns + duty_pct - sequentially, in the one loop
+    thread, and BOTH are gated by the same phase2.writes_disabled ABI
+    latch (checked by the callers, not here).
 
-    Concurrency (reviewer): the contract gives the knobs map exactly
-    two writers - the loader's one-time seed at scheduler start, and
-    this daemon. The kernel only READS knobs and reports through
-    `demotions`, so a torn read-modify-write interleaving is
-    impossible in v1; if a future phase adds a second runtime writer,
+    Returns True only on a confirmed bpftool success.
+
+    Concurrency (reviewer, text preserved from Phase 2): the contract
+    gives the knobs map exactly two writers - the loader's one-time
+    seed at scheduler start, and this daemon. The kernel only READS
+    knobs and reports through `demotions`, so a torn read-modify-write
+    interleaving is impossible as long as ALL writers stay on this one
+    sequential thread; if a future phase adds a second runtime writer,
     this needs a compare-and-swap discipline, not silence.
     """
-    step = "knobs RMW (interactive_slice_ns)"
     got = read_knobs(step)
     if got is None:
         # read_knobs already said why (absent or wrong size); never
         # fabricate a struct: we do not own the other fields.
         return False
-    raw_new = knobs_rebuild(got[1], new_slice_ns)
+    raw_new = knobs_rebuild(got[1], interactive_ns, batch_ns, duty_pct)
     key = (0).to_bytes(4, "little")
     # Same verified argv discipline as update_task_class: ONE TOKEN
     # PER BYTE (see the bpftool FORMATS section of the header).
@@ -1355,6 +1566,17 @@ def write_knob_interactive_slice(new_slice_ns):
         log("knobctl: knobs update failed (%s); belief unchanged, the "
             "rule will retry while it still holds" % err)
     return ok
+
+
+def write_knob_interactive_slice(new_slice_ns):
+    """Phase 2: the interactive_slice_ns-only knobs RMW (unchanged
+    behavior; the body moved to write_knobs_fields in Phase 3, which
+    the energy state machine uses for batch_slice_ns with the same
+    latch, the same full-struct RMW and the same argv discipline).
+    Returns True only on a confirmed bpftool success.
+    """
+    return write_knobs_fields(interactive_ns=new_slice_ns,
+                              step="knobs RMW (interactive_slice_ns)")
 
 
 def _delete_demotion(raw_key, step):
@@ -1532,6 +1754,774 @@ def run_knob_cycle(phase2):
 
 
 # ---------------------------------------------------------------------------
+# PHASE 3: energy-adaptive scheduling
+# (battery collector + hysteresis state machine + per-process energy
+# accounting + --energy-probe). Additive; see the PHASE 3 header section
+# for the design contracts and the empirical validation notes.
+# ---------------------------------------------------------------------------
+
+def clk_tck():
+    """PHASE 3 (PURE, cached): the clock-tick scale for /proc stat
+    times. os.sysconf('SC_CLK_TCK'), with a 100 fallback (the Linux
+    default) if the sysconf call fails or returns something absurd -
+    a bogus scale would corrupt every cpu-sec/min number."""
+    global _CLK_TCK
+    if _CLK_TCK is None:
+        try:
+            val = os.sysconf("SC_CLK_TCK")
+        except (ValueError, OSError, AttributeError):
+            val = 100
+        _CLK_TCK = val if isinstance(val, int) and val > 0 else 100
+    return _CLK_TCK
+
+
+# PHASE 3 (battery collector): ONE PowerShell invocation gathers BOTH
+# CIM sources (root/wmi BatteryStatus + Win32_Battery) so the measured
+# ~3.5s interop startup cost is paid once per refresh, not twice.
+# Transport is -EncodedCommand: the script travels as ONE base64
+# UTF-16LE argv element, so no shell ever re-splits it (the empirically
+# fatal quoting path is powershell.exe -> wsl.exe -> bash: each layer
+# eats one quoting level; Python list-argv subprocess + -EncodedCommand
+# bypasses all of them). Verified live on this machine in both power
+# states (see the PHASE 3 header section).
+ENERGY_PS_SCRIPT = (
+    "[pscustomobject]@{"
+    "status=(Get-CimInstance -Namespace root/wmi -ClassName BatteryStatus"
+    " | Select-Object Charging,Discharging,PowerOnline,DischargeRate,"
+    "ChargeRate);"
+    "battery=(Get-CimInstance Win32_Battery"
+    " | Select-Object EstimatedChargeRemaining,BatteryStatus)"
+    "} | ConvertTo-Json -Compress -Depth 3"
+)
+
+
+def _first_cim_mapping(value):
+    """PHASE 3 (PURE, unit-tested): CIM via ConvertTo-Json yields a
+    single {...} for one instance and an array for several (multi-
+    battery hosts); defensively accept either at every level and
+    return the first mapping, or {} when there is none."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
+def _parse_power_ps_json(text):
+    """PHASE 3 (PURE, unit-tested): the combined PowerShell JSON ->
+    one power sample dict. Raises ValueError on unparseable text (the
+    caller degrades to {"present": False}; it never crashes the loop).
+
+    Source decision (EMPIRICAL, this machine, both states observed):
+    the root/wmi Discharging flag is the PRIMARY on-battery signal;
+    Win32_Battery.BatteryStatus is the cross-check (1 = discharging,
+    2 = "AC", 6-9 = charging on AC). Both agreed in every observed
+    state; on disagreement the sample says so and root/wmi is trusted
+    (the caller logs it once per run). drain_mw is the measured
+    DischargeRate (mW) ONLY while discharging - a charging system's
+    ChargeRate is inflow, not drain, and is never reported as such.
+    """
+    data = json.loads(text)
+    if isinstance(data, list):  # defensive: array-shaped top level
+        data = _first_cim_mapping(data)
+    if not isinstance(data, dict) or not data:
+        # A payload with NO objects (empty array, a bare scalar) means
+        # the query produced nothing: "unavailable" (the collector
+        # degrades to {"present": False}) is the honest verdict, not a
+        # phantom "present but unknown" sample.
+        raise ValueError("no CIM objects in payload")
+    status = _first_cim_mapping(data.get("status"))
+    battery = _first_cim_mapping(data.get("battery"))
+    discharging = status.get("Discharging")
+    power_online = status.get("PowerOnline")
+    discharge_rate = status.get("DischargeRate")
+    percent = battery.get("EstimatedChargeRemaining")
+    w32_status = battery.get("BatteryStatus")
+    # Cross-check opinions: root/wmi (primary) and Win32_Battery.
+    root_opinion = discharging if isinstance(discharging, bool) else None
+    if w32_status == 1:
+        w32_opinion = True   # "Discharging"
+    elif w32_status in (2, 6, 7, 8, 9):
+        w32_opinion = False  # "AC" / charging on AC
+    else:
+        w32_opinion = None   # unknown code (or field missing)
+    if root_opinion is not None:
+        on_battery = root_opinion
+    elif w32_opinion is not None:
+        on_battery = w32_opinion
+    else:
+        on_battery = None    # no usable signal: NO EVIDENCE
+    if root_opinion is not None and w32_opinion is not None:
+        cross_check = ("agree" if root_opinion == w32_opinion
+                       else "disagree")
+    elif root_opinion is not None or w32_opinion is not None:
+        cross_check = "single-source"
+    else:
+        cross_check = "unknown"
+    if on_battery:
+        drain_mw = (float(discharge_rate)
+                    if isinstance(discharge_rate, (int, float)) else None)
+    elif on_battery is False:
+        drain_mw = 0.0       # on mains: measured DischargeRate is 0
+    else:
+        drain_mw = None
+    return {"present": True, "source": "powershell",
+            "on_battery": on_battery,
+            "percent": (float(percent)
+                        if isinstance(percent, (int, float)) else None),
+            "drain_mw": drain_mw,
+            "cross_check": cross_check,
+            "win32_battery_status": w32_status,
+            "power_online": power_online}
+
+
+def _sample_from_sysfs():
+    """PHASE 3 (battery collector): /sys/class/power_supply first -
+    zero-cost and future-proof for a host that exposes supplies.
+
+    Returns a sample dict, or None when there is nothing usable (an
+    empty directory - the WSL2 case, verified live - or any read
+    failure), in which case the caller falls back to PowerShell
+    interop. HONEST LIMITATION: under WSL2 this directory is empty, so
+    this parser is the one Phase 3 path that CANNOT be exercised on
+    this machine - best-effort, flagged for the reviewer.
+    """
+    try:
+        supplies = os.listdir("/sys/class/power_supply")
+    except OSError:
+        return None
+    if not supplies:
+        return None
+    on_battery = False
+    saw_battery = False
+    percent = None
+    drain_mw = None
+    for name in sorted(supplies):
+        base = "/sys/class/power_supply/" + name
+
+        def _read(fname):
+            try:
+                with open(base + "/" + fname, "r") as fh:
+                    return fh.read().strip()
+            except OSError:
+                return None
+
+        if _read("type") != "Battery":
+            continue  # Mains/USB/etc.: AC state comes from the battery
+        saw_battery = True
+        if _read("status") == "Discharging":
+            on_battery = True
+        cap = _read("capacity")
+        if cap is not None:
+            try:
+                percent = float(cap)
+            except ValueError:
+                pass
+        # Drain: power_now is uW; else current_now (uA) * voltage_now (uV)
+        # is uW. Only meaningful while discharging.
+        power_uw = None
+        raw = _read("power_now")
+        if raw is not None:
+            try:
+                power_uw = float(raw)
+            except ValueError:
+                power_uw = None
+        if power_uw is None:
+            cur = _read("current_now")
+            vol = _read("voltage_now")
+            if cur is not None and vol is not None:
+                try:
+                    power_uw = float(cur) * float(vol) / 1e6
+                except ValueError:
+                    power_uw = None
+        if on_battery and power_uw is not None:
+            drain_mw = power_uw / 1000.0
+    if not saw_battery:
+        return None  # no battery exposed: let PowerShell try anyway
+    if on_battery:
+        drain = drain_mw
+    else:
+        drain = 0.0
+    return {"present": True, "source": "sysfs", "on_battery": on_battery,
+            "percent": percent, "drain_mw": drain,
+            "cross_check": "single-source", "win32_battery_status": None,
+            "power_online": not on_battery}
+
+
+def read_power_sample():
+    """PHASE 3 (battery collector): one refresh -> one sample dict.
+
+    Tries /sys/class/power_supply first (future-proof, zero cost),
+    then PowerShell interop, and degrades to {"present": False} on ANY
+    failure (missing powershell.exe, timeout, unparseable JSON). It
+    NEVER raises: the 2s loop must not learn about Windows from here.
+    The caller caches the result per refresh cycle; consumers (state
+    machine, report, probe) read the cached sample.
+    """
+    sample = _sample_from_sysfs()
+    if sample is not None:
+        return sample
+    try:
+        encoded = base64.b64encode(ENERGY_PS_SCRIPT.encode("utf-16-le"))
+        proc = subprocess.run(
+            [ENERGY_PS_PATH, "-NoProfile",
+             "-EncodedCommand", encoded.decode("ascii")],
+            capture_output=True, timeout=ENERGY_PS_TIMEOUT_S)
+        if proc.returncode != 0:
+            raise OSError("powershell.exe exit code %d: %s"
+                          % (proc.returncode,
+                             proc.stderr.decode("utf-8", "replace")
+                             .strip()[:120]))
+        return _parse_power_ps_json(proc.stdout.decode("utf-8", "replace"))
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        # Graceful degradation per spec: unavailable -> {"present": False}.
+        absent = dict(ENERGY_SAMPLE_ABSENT)
+        absent["error"] = str(exc)[:120]
+        return absent
+
+
+def _battery_trigger_text(sample):
+    """PHASE 3 (PURE, unit-tested): the human trigger text for a
+    CONSERVE entry - battery percent and measured drain when known,
+    'n/a' honestly when not."""
+    pct = sample.get("percent")
+    drain = sample.get("drain_mw")
+    return "battery discharging (percent=%s, drain=%s mW)" % (
+        "n/a" if pct is None else pct,
+        "n/a" if drain is None else "%.0f" % drain)
+
+
+class EnergyState:
+    """PHASE 3 (energy state with hysteresis): PERFORMANCE vs CONSERVE.
+
+    PURE LOGIC over caller-supplied samples and monotonic timestamps -
+    no bpftool, no subprocess, no clocks of its own - so the whole
+    policy is unit-testable offline (foresight_phase3_tests.py), the
+    same discipline as the Phase 2 KnobController.
+
+    Rules (see the PHASE 3 header section for the full contract):
+      - --force-conserve: CONSERVE from construction, regardless of
+        any sample (the controlled acceptance runs on AC).
+      - Enter CONSERVE on the first sample that reports discharging.
+        Entry is IMMEDIATE; only EXIT is hysteretic.
+      - Exit CONSERVE only after ENERGY_HYSTERESIS_S (60s) of
+        CONTINUOUS mains: the clock arms at the first successful mains
+        reading inside CONSERVE, and any sample that is NOT a
+        successful mains reading (discharging again, or unavailable/
+        unknown) resets it. Absence is not continuity, and staying in
+        CONSERVE is the fail-safe direction.
+      - A present-but-ambiguous sample (on_battery None) behaves like
+        an absent one: no transitions, streak reset.
+
+    Knob belief (mirror of KnobController): the CONSERVE target is
+    BATCH_SLICE_CONSERVE (5ms), the PERFORMANCE target
+    BATCH_SLICE_DEFAULT (20ms, the loader seed). The live value is
+    ADOPTED read-only once per scheduler instance; a write confirms
+    (apply) only on bpftool success, so a failed write keeps the old
+    belief and the level-triggered retry re-fires on the next refresh.
+    """
+
+    def __init__(self, force_conserve=False):
+        self.force_conserve = bool(force_conserve)
+        self.state = (ENERGY_STATE_CONSERVE if self.force_conserve
+                      else ENERGY_STATE_PERFORMANCE)
+        self.mains_since = None   # monotonic anchor of the mains streak
+        self.sample = dict(ENERGY_SAMPLE_ABSENT)
+        self.last_poll = None     # monotonic; drives the refresh cadence
+        self.batch_slice_ns = BATCH_SLICE_DEFAULT  # last CONFIRMED value
+        # PHASE 3.5: duty-window belief, mirror of the batch-slice belief
+        # (CONSERVE -> BATCH_DUTY_CONSERVE, PERFORMANCE -> 0/unlimited).
+        self.duty_pct = BATCH_DUTY_UNLIMITED  # last CONFIRMED value
+        self.synced = False       # True once adopted from the live map
+        self.cross_check_warned = False  # one-source-disagreement line
+        self.disabled_announced = False  # one latched-writes line
+
+    def mark_restart(self):
+        """Scheduler restart (fresh knobs map): drop ONLY the knob
+        belief - the next energy cycle re-adopts the fresh loader seed
+        read-only and re-writes it if the state demands (CONSERVE).
+        Power state is machine-level, NOT scheduler-level: the
+        hysteresis clock and the accounting baseline stay."""
+        self.synced = False
+        self.disabled_announced = False
+
+    def adopt(self, batch_ns):
+        """Believe the value the live knobs[0] holds (once per
+        scheduler instance; Phase 2 parity: a previous daemon
+        generation may have left 5ms in place, and assuming the
+        loader's 20ms seed would print a bogus 'old value' on the
+        first change)."""
+        self.batch_slice_ns = batch_ns
+        self.synced = True
+
+    def apply(self, batch_ns):
+        """Confirm one successful batch-slice write. Called ONLY on
+        bpftool success: on failure the belief keeps the old value so
+        the level-triggered correction re-fires next refresh."""
+        self.batch_slice_ns = batch_ns
+
+    def adopt_duty(self, duty_pct):
+        """PHASE 3.5: believe the live duty value (Phase 2 parity with
+        the batch-slice adoption)."""
+        self.duty_pct = duty_pct
+        self.synced = True
+
+    def apply_duty(self, duty_pct):
+        """PHASE 3.5: confirm one successful duty write."""
+        self.duty_pct = duty_pct
+
+    def desired_batch_slice_ns(self):
+        """The batch slice the CURRENT state owns (EnergyState owns
+        ONLY batch_slice_ns; interactive_slice_ns is Phase 2's)."""
+        return (BATCH_SLICE_CONSERVE
+                if self.state == ENERGY_STATE_CONSERVE
+                else BATCH_SLICE_DEFAULT)
+
+    def desired_batch_duty_pct(self):
+        """PHASE 3.5 (the duty-window gate): the batch lane is served
+        only during the first duty% of each 100ms window while CONSERVE
+        (kernel-side gate on BATCH_DSQ consumption; batch tasks stay
+        queued, off-CPU - real idle, real C-states). 0 = unlimited in
+        PERFORMANCE. Framing caution (reviewer-endorsed): this lowers
+        INSTANTANEOUS drain (survival-until-outlet), not total
+        energy-to-completion - 25% power x ~4x wall time is the same
+        joules; the energy win comes from the idle windows, not the
+        throttling itself."""
+        return (BATCH_DUTY_CONSERVE
+                if self.state == ENERGY_STATE_CONSERVE
+                else BATCH_DUTY_UNLIMITED)
+
+    def refresh_battery(self, now):
+        """Run the collector at most once per ENERGY_POLL_INTERVAL_S
+        (MEASURED monotonic, like every rate in this daemon; the
+        ~3.5s PowerShell stall lands on one pass per interval - the
+        same measured-wall-time class as the offset recheck, so the
+        knob controller's rate math is unaffected). Returns True
+        exactly when a fresh sample was taken this call."""
+        if (self.last_poll is not None
+                and now - self.last_poll < ENERGY_POLL_INTERVAL_S):
+            return False
+        self.last_poll = now
+        self.sample = read_power_sample()
+        if (self.sample.get("cross_check") == "disagree"
+                and not self.cross_check_warned):
+            self.cross_check_warned = True
+            log("energy: power sources DISAGREE (root/wmi "
+                "Discharging=%s vs Win32_Battery.BatteryStatus=%s); "
+                "trusting root/wmi (the empirically verified primary "
+                "on this machine)"
+                % (self.sample.get("on_battery"),
+                   self.sample.get("win32_battery_status")))
+        return True
+
+    def observe(self, now):
+        """Feed the CURRENT cached sample at monotonic time now.
+        Returns None, or (transition, trigger_text) on a state
+        change: transition is "enter_conserve" or "exit_conserve"."""
+        sample = self.sample
+        if self.force_conserve:
+            if self.state != ENERGY_STATE_CONSERVE:
+                self.state = ENERGY_STATE_CONSERVE
+                self.mains_since = None
+                return ("enter_conserve", "forced by --force-conserve")
+            return None
+        if sample.get("present") and sample.get("on_battery"):
+            # Discharging (primary signal: root/wmi Discharging, the
+            # empirically verified source). Entry is immediate; any
+            # battery observation kills a mains streak.
+            self.mains_since = None
+            if self.state != ENERGY_STATE_CONSERVE:
+                self.state = ENERGY_STATE_CONSERVE
+                return ("enter_conserve", _battery_trigger_text(sample))
+            return None
+        if sample.get("present") and sample.get("on_battery") is False:
+            # A SUCCESSFUL mains reading. Inside CONSERVE it arms (or
+            # advances) the hysteresis clock; the exit fires only when
+            # the mains streak has held >= ENERGY_HYSTERESIS_S.
+            if self.state == ENERGY_STATE_CONSERVE:
+                if self.mains_since is None:
+                    self.mains_since = now
+                    return None
+                held = now - self.mains_since
+                if held >= ENERGY_HYSTERESIS_S:
+                    self.state = ENERGY_STATE_PERFORMANCE
+                    self.mains_since = None
+                    return ("exit_conserve",
+                            "mains held for %.0fs (>= %ds hysteresis)"
+                            % (held, int(ENERGY_HYSTERESIS_S)))
+                return None
+            self.mains_since = None
+            return None
+        # Absent/unavailable/ambiguous sample: NO evidence either way.
+        # Never flips the state, and breaks any mains streak (see the
+        # class docstring: absence is not continuity).
+        self.mains_since = None
+        return None
+
+
+def run_energy_cycle(phase2, energy):
+    """PHASE 3 (batch deferral under energy pressure): one invocation
+    per loop pass.
+      (1) once per scheduler instance, adopt the live batch_slice_ns
+          (read-only);
+      (2) refresh the battery/AC sample at most once per
+          ENERGY_POLL_INTERVAL_S;
+      (3) feed the hysteresis state machine;
+      (4) at most ONE knobs read-modify-write when the state's target
+          differs from the confirmed belief - LEVEL-triggered, so a
+          failed write retries on the next refresh pass, the same
+          self-healing discipline as a Phase 2 rule whose write failed.
+    The phase2.writes_disabled latch (knobs ABI mismatch) gates this
+    write exactly like the Phase 2 interactive writes: one latch, both
+    phases' fields.
+    """
+    if exit_requested:
+        return
+    now = time.monotonic()
+    if not energy.synced:
+        got = read_knobs("knobs adoption read (energy)")
+        if got is None:
+            # Absent or not contract-shaped: the SAME latch Phase 2
+            # uses goes off; batch writes stay off for this run rather
+            # than risk corrupting an unrecognized struct.
+            phase2.writes_disabled = True
+            energy.synced = True  # do not re-dump every pass
+            log("energy: no contract-shaped knobs[0] to adopt; batch "
+                "knob writes are DISABLED this run")
+        else:
+            energy.adopt(got[0][1])
+            energy.adopt_duty(got[0][3])   # PHASE 3.5: duty belief
+            log("energy: adopted live batch_slice_ns=%d duty_pct=%d from "
+                "knobs[0] (read-only, no write)"
+                % (got[0][1], got[0][3]))
+    now2 = time.monotonic()
+    refreshed = energy.refresh_battery(now2)
+    if refreshed:
+        action = energy.observe(now2)
+        if action is not None:
+            transition, trigger = action
+            log("ENERGY: %s (trigger: %s); mode=%s"
+                % ("entered CONSERVE" if transition == "enter_conserve"
+                   else "left CONSERVE -> PERFORMANCE", trigger,
+                   "forced (--force-conserve)" if energy.force_conserve
+                   else "adaptive"))
+    else:
+        # Reviewer 5 finding 3: a skipped/failed battery refresh must
+        # not delay the desired-vs-belief write by a full poll cadence
+        # (up to 30s of batch lane at 20ms while CONSERVE wants 5ms is
+        # the anti-conservative direction). The state machine holds on
+        # the last-known sample - only observe() needs fresh data; the
+        # write reconcile below still runs every pass.
+        action = None
+    desired = energy.desired_batch_slice_ns()
+    desired_duty = energy.desired_batch_duty_pct()
+    if (energy.batch_slice_ns == desired
+            and energy.duty_pct == desired_duty):
+        return  # belief already matches the state: nothing to write
+    if phase2.writes_disabled:
+        # The Phase 2 latch gates Phase 3 too; announce once per run.
+        if not energy.disabled_announced:
+            energy.disabled_announced = True
+            why = (action[1] if action else
+                   "state target %d/%d != adopted value %d/%d"
+                   % (desired, desired_duty, energy.batch_slice_ns,
+                      energy.duty_pct))
+            log("energy: state=%s wants batch_slice_ns=%d duty_pct=%d "
+                "(%s) but knob writes are DISABLED (knobs ABI mismatch); "
+                "the values stay %d/%d"
+                % (energy.state, desired, desired_duty, why,
+                   energy.batch_slice_ns, energy.duty_pct))
+        return
+    if write_knobs_fields(batch_ns=desired, duty_pct=desired_duty,
+                          step="knobs RMW (batch_slice_ns + duty)"):
+        old = energy.batch_slice_ns
+        old_duty = energy.duty_pct
+        energy.apply(desired)
+        energy.apply_duty(desired_duty)
+        why = (action[1] if action else
+               "state=%s target differs from the adopted/live value "
+               "(startup, scheduler restart, or a failed earlier "
+               "write)" % energy.state)
+        # The ONE explainable line per actual knob change (same shape
+        # as Phase 2's): old value, new value, the trigger, the mode.
+        log("ENERGY: batch_slice_ns %d -> %d, duty_pct %d -> %d "
+            "(trigger: %s; state=%s, mode=%s)"
+            % (old, desired, old_duty, desired_duty, why, energy.state,
+               "forced (--force-conserve)"
+               if energy.force_conserve else "adaptive"))
+    # else: write_knobs_fields already logged the failure and the belief
+    # is unchanged, so the level-trigger retries on the next refresh.
+
+
+# --- PHASE 3: per-process energy accounting (the "joules proxy") -----
+
+def _read_proc_stat_sample():
+    """PHASE 3: one /proc sweep -> {pid: (starttime, comm, utime+stime)}.
+
+    Field layout of /proc/<pid>/stat (proc(5)): comm sits in parens
+    and MAY contain spaces and parens itself, so the line is split on
+    the LAST ')'. After it, index 0 is field 3 (state), which puts
+    utime (field 14) at index 11, stime (15) at 12, and starttime
+    (22) at 19. starttime is what makes pid reuse detectable: a
+    recycled pid carries a different start time. Tasks that vanish
+    mid-scan are skipped silently (normal churn, exactly like
+    scan_proc_comms). Top-level /proc entries are TASK-granular
+    (threads included) - the same granularity as the classifier.
+    """
+    out = {}
+    for stat_path in glob.glob("/proc/[0-9]*/stat"):
+        try:
+            pid = int(stat_path.split("/")[2])
+            with open(stat_path, "rb") as fh:
+                data = fh.read().decode("ascii", "replace")
+            rparen = data.rfind(")")
+            head = data[:rparen]          # "  <pid> (<comm>"
+            comm = head[head.find("(") + 1:] if "(" in head else "?"
+            rest = data[rparen + 1:].split()
+            utime = int(rest[11])
+            stime = int(rest[12])
+            starttime = int(rest[19])
+        except (ValueError, IndexError, OSError):
+            continue  # vanished mid-scan or a kernel thread quirk
+        out[pid] = (starttime, comm, utime + stime)
+    return out
+
+
+def _compute_cpu_rates(prev, cur, elapsed_min):
+    """PHASE 3 (PURE, unit-tested): two snapshots + the MEASURED
+    elapsed minutes -> {pid: (comm, cpu_sec_per_min)}.
+
+    A pid counts only when BOTH snapshots carry the same starttime:
+    a vanished pid is skipped (no predecessor), and a REUSED pid (the
+    starttime changed) gets its baseline reset - it simply has no rate
+    this window instead of inheriting its predecessor's CPU time.
+    A negative tick delta is counter nonsense (never happens for a
+    live task) and is skipped rather than propagated.
+    """
+    rates = {}
+    scale = float(clk_tck())
+    for pid, (start, comm, ticks) in cur.items():
+        old = prev.get(pid)
+        if old is None or old[0] != start:
+            continue  # new task, or pid reuse: baseline (re)starts now
+        dticks = ticks - old[2]
+        if dticks < 0:
+            continue
+        rates[pid] = (comm, dticks / scale / elapsed_min)
+    return rates
+
+
+def _select_batch_lane(rates, rules, batch_pids):
+    """PHASE 3 (PURE, unit-tested): which sampled tasks count toward
+    the batch lane (the probe's batch_cpu_sec_per_min):
+      - every pid the daemon classified batch (its OWN task_class
+        writebacks: CLASS_BATCH entries in the reconcile `state`),
+        plus
+      - every UNCLASSIFIED task (comm not in the effective rules
+        table) burning more than ENERGY_HOG_RATE cpu-sec/min (>50% of
+        one core): class 0 lands in BATCH_DSQ by design (verified in
+        foresight_sched.bpf.c), so such a hog IS batch-lane load.
+    Kernel behavior-demoted pids are deliberately NOT special-cased:
+    they are not daemon writebacks, and a demoted task burning >50%
+    of a core is caught by the hog rule anyway (reviewer note).
+    Returns (sum_cpu_sec_per_min, n_classified, n_hogs).
+    """
+    total = 0.0
+    n_classified = 0
+    n_hogs = 0
+    for pid, (comm, rate) in rates.items():
+        if pid in batch_pids:
+            total += rate
+            n_classified += 1
+        elif comm not in rules and rate > ENERGY_HOG_RATE:
+            total += rate
+            n_hogs += 1
+    return total, n_classified, n_hogs
+
+
+class EnergyAccounting:
+    """PHASE 3 (per-process energy accounting): /proc stat deltas ->
+    cpu-sec/min per pid, ranked, printed, and summarized for the probe.
+
+    A cpu-SECOND is what a stdlib-only daemon can measure without
+    PMUs or vendor tools; multiplying a task's share by a measured
+    drain rate (mW) when discharging gives an honest ESTIMATED
+    battery share, printed labelled as a proxy - joules, we cannot
+    measure; CPU-seconds, we can. The pass runs on its OWN cadence
+    (ENERGY_ACCOUNT_INTERVAL_S, monotonic-gated from the loop),
+    deliberately separate from the 2s classification cycle.
+    """
+
+    def __init__(self):
+        self.prev = None        # pid -> (starttime, comm, utime+stime)
+        self.last_at = None     # monotonic; also the cadence gate
+        self.window_s = None    # measured length of the latest window
+        self.total_rate = None  # latest sum over ALL sampled tasks
+        self.batch_rate = None  # latest batch-lane sum (probe field)
+        self.top = []           # latest top-5 [(pid, comm, rate, share%)]
+
+    def pass_once(self, now, rules, batch_pids, energy):
+        """One dedicated pass: sample, diff, rank, print one block."""
+        cur = _read_proc_stat_sample()
+        if self.prev is None or self.last_at is None:
+            self.prev = cur
+            self.last_at = now
+            log("energy-acct: baseline set (%d tasks, clk_tck=%d); "
+                "cpu-sec/min rates start next window"
+                % (len(cur), clk_tck()))
+            return
+        elapsed_s = now - self.last_at
+        if elapsed_s <= 0:
+            return  # monotonic misbehavior: skip, never divide by ~0
+        rates = _compute_cpu_rates(self.prev, cur, elapsed_s / 60.0)
+        self.prev = cur
+        self.last_at = now
+        if not rates:
+            return  # nothing comparable this window (fresh pids only)
+        total = sum(rate for _comm, rate in rates.values())
+        ranked = sorted(rates.items(), key=lambda kv: (-kv[1][1], kv[0]))
+        batch_rate, n_classified, n_hogs = _select_batch_lane(
+            rates, rules, batch_pids)
+        self.window_s = elapsed_s
+        self.total_rate = total
+        self.top = [(pid, comm, rate,
+                     (rate / total * 100.0) if total > 0 else 0.0)
+                    for pid, (comm, rate) in ranked[:ENERGY_ACCOUNT_TOP_N]]
+        self.batch_rate = batch_rate
+        log("energy-acct: window %.1fs: %d task(s) with deltas, total "
+            "%.1f cpu-sec/min; batch-lane %.1f cpu-sec/min (%d "
+            "daemon-batch + %d unclassified hog(s) >%.0f%% core)"
+            % (elapsed_s, len(rates), total, batch_rate, n_classified,
+               n_hogs, ENERGY_HOG_RATE / 60.0 * 100.0))
+        log("energy-acct: top %d by cpu-sec/min (share of sampled "
+            "total):" % len(self.top))
+        for idx, (pid, comm, rate, share) in enumerate(self.top, 1):
+            log("energy-acct:  %d. pid=%d comm='%s' %.2f cpu-sec/min "
+                "%.1f%%" % (idx, pid, comm, rate, share))
+        if energy.state == ENERGY_STATE_CONSERVE:
+            drain = energy.sample.get("drain_mw")
+            if drain:
+                top_rate = sum(item[2] for item in self.top)
+                share = (top_rate / total * 100.0) if total > 0 else 0.0
+                log("energy-acct: CONSERVE: measured drain %.0f mW; "
+                    "top-%d estimated battery share %.0f%% (~%.1f W) "
+                    "- cpu-seconds as an honest proxy, not joules"
+                    % (drain, len(self.top), share,
+                       drain * share / 100000.0))
+            else:
+                log("energy-acct: CONSERVE: drain rate unavailable "
+                    "(on AC or no battery data); battery-share "
+                    "estimate suppressed")
+
+
+def run_energy_accounting(acct, rules, state, energy, kernel_managed=None):
+    """PHASE 3 (per-process energy accounting): cadence gate + error
+    guard for the 10s pass. /proc churn here is NEVER fatal and NEVER
+    feeds the classification fail_streak: these are plain file reads,
+    not bpftool steps - a vanished pid between glob and open is
+    normal. Batch-lane membership comes from the daemon's OWN
+    writebacks: the ns pids recorded in `state` with class 2 (the
+    accounting works in the same /proc pid space reconcile does) -
+    PLUS, per reviewer 5 finding 4, the pids the KERNEL demoted into
+    the batch lane (kernel_managed: recorded interactive in `state`
+    by the flapping-gate contract, but routed to BATCH_DSQ by the
+    kernel - omitting them would undercount exactly the heaviest
+    batch-lane load)."""
+    if exit_requested:
+        return
+    now = time.monotonic()
+    if (acct.last_at is not None
+            and now - acct.last_at < ENERGY_ACCOUNT_INTERVAL_S):
+        return
+    batch_pids = {ns for ns, (_g, cls) in state.items()
+                  if cls == CLASS_BATCH}
+    if kernel_managed:
+        for ns, (g, cls) in state.items():
+            if g in kernel_managed:
+                batch_pids.add(ns)
+    try:
+        acct.pass_once(now, rules, batch_pids, energy)
+    except Exception as exc:  # best-effort by design (see docstring)
+        log("energy-acct: pass failed unexpectedly (%r); will retry "
+            "next window" % exc)
+
+
+# --- PHASE 3: --energy-probe (measured-delta acceptance hook) --------
+
+class EnergyProbe:
+    """PHASE 3: cadence holder for --energy-probe (one JSON line per
+    ENERGY_PROBE_INTERVAL_S, monotonic-gated from the loop)."""
+
+    def __init__(self):
+        self.last_at = None
+
+
+def _energy_probe_dict(mode, battery_pct, drain_mw, batch_rate, i_ns, b_ns):
+    """PHASE 3 (PURE, unit-tested): the --energy-probe line body.
+    FIXED key order (ENERGY_PROBE_KEYS) is the wire contract the
+    maintainer's comparison script parses; values may be None
+    (rendered null) when honestly unknown."""
+    return {"mode": mode,
+            "battery_pct": battery_pct,
+            "drain_mw": drain_mw,
+            "batch_cpu_sec_per_min": batch_rate,
+            "interactive_slice_ns": i_ns,
+            "batch_slice_ns": b_ns}
+
+
+def maybe_emit_energy_probe(probe, phase2, energy, acct):
+    """PHASE 3 (measured-delta acceptance hook): one compact JSON line
+    every ENERGY_PROBE_INTERVAL_S. Printed WITHOUT the daemon log
+    prefix so the line starts with '{' and greps/parses cleanly; all
+    other daemon lines keep the prefix. The slice values are read
+    LIVE from knobs[0] - the receipt must show the map's truth, not a
+    belief; a failed read (or a latched-off map) falls back to the
+    confirmed beliefs so the line's shape never breaks."""
+    if exit_requested:
+        return
+    now = time.monotonic()
+    if (probe.last_at is not None
+            and now - probe.last_at < ENERGY_PROBE_INTERVAL_S):
+        return
+    probe.last_at = now
+    if phase2.writes_disabled:
+        i_ns = phase2.knob.slice_ns
+        b_ns = energy.batch_slice_ns
+    else:
+        try:
+            got = read_knobs("energy probe knobs read")
+        except DaemonError:
+            got = None  # observational only: fall back to beliefs
+        if got is not None:
+            i_ns, b_ns = got[0][0], got[0][1]
+        else:
+            i_ns = phase2.knob.slice_ns
+            b_ns = energy.batch_slice_ns
+    sample = energy.sample
+    if sample.get("present") and sample.get("on_battery"):
+        drain = sample.get("drain_mw")       # measured, discharging only
+    elif sample.get("present") and sample.get("on_battery") is False:
+        drain = 0.0                          # on mains: DischargeRate is 0
+    else:
+        drain = None                         # honestly unknown (reviewer 5
+                                             # finding 2: 0.0 would assert
+                                             # mains on a batteryless host)
+    rate = acct.batch_rate
+    line = _energy_probe_dict(energy.state, sample.get("percent"), drain,
+                              None if rate is None else round(rate, 2),
+                              i_ns, b_ns)
+    # Defensive shape check: the key order IS the contract; assert it
+    # cheaply on every line (tuple(dict) == the key tuple).
+    if tuple(line) != ENERGY_PROBE_KEYS:  # pragma: no cover - invariant
+        log("energy-probe: internal key-order drift (%s); skipping line"
+            % (tuple(line),))
+        return
+    print(json.dumps(line, separators=(",", ":")), flush=True)
+
+
+# ---------------------------------------------------------------------------
 # --test mode
 # ---------------------------------------------------------------------------
 
@@ -1611,8 +2601,12 @@ def kill_test_children(children):
 # Preflight and main
 # ---------------------------------------------------------------------------
 
-USAGE = "usage: foresight_daemon.py [--test]  (--test: spawn fake chrome/" \
-        "cargo workloads; see header docstring)"
+USAGE = "usage: foresight_daemon.py [--test] [--energy-probe] " \
+        "[--force-conserve]  (--test: spawn fake chrome/cargo workloads; " \
+        "--energy-probe: print one compact JSON line every 5s for the " \
+        "controlled energy delta test; --force-conserve: pin the energy " \
+        "state to CONSERVE regardless of power source; see the header " \
+        "docstring)"
 
 
 def locate_bpftool():
@@ -1669,7 +2663,15 @@ def preflight():
 def main():
     args = sys.argv[1:]
     test_mode = "--test" in args
-    args = [a for a in args if a != "--test"]
+    # PHASE 3 (energy-adaptive scheduling): two additive flags, parsed
+    # in the same manual style as --test; unknown args still exit 6.
+    #   --energy-probe: the measured-delta acceptance hook (JSON lines).
+    #   --force-conserve: pin CONSERVE regardless of power source (the
+    #     controlled acceptance test runs on AC).
+    energy_probe_mode = "--energy-probe" in args
+    force_conserve = "--force-conserve" in args
+    args = [a for a in args if a not in ("--test", "--energy-probe",
+                                         "--force-conserve")]
     if "-h" in args or "--help" in args:
         print(USAGE)
         return 0
@@ -1764,6 +2766,18 @@ def main():
     # DaemonError -> fail_streak -> exit 10. No new exit codes.
     phase2 = Phase2State()
 
+    # PHASE 3 state: the energy state machine (owns ONLY batch_slice_ns;
+    # the Phase 2 ABI-mismatch latch gates both phases' writes), the
+    # per-process energy accounting and the --energy-probe cadence
+    # holder. All three run inside the loop's existing try block below
+    # and inherit its exception ladder unchanged - no new exit codes.
+    energy = EnergyState(force_conserve=force_conserve)
+    if force_conserve:
+        log("energy: --force-conserve given; CONSERVE from startup, "
+            "regardless of power source")
+    acct = EnergyAccounting()
+    probe = EnergyProbe()
+
     try:
         while not exit_requested:
             # The pin check IS the scheduler-alive check (pin lifecycle
@@ -1815,7 +2829,7 @@ def main():
                 # the common case instantly.
                 if pass_count % MAP_ID_CHECK_PASSES == 0:
                     check_map_ids(initial_ids, state, failcount, abandoned,
-                                  phase2)
+                                  phase2, energy)
                 # Phase 2 listener BEFORE reconcile: events drained
                 # this cycle must gate THIS cycle's classification
                 # writes - otherwise a freshly-demoted pid is
@@ -1827,6 +2841,16 @@ def main():
                 # Phase 2 adaptive-knob controller: stats -> rates ->
                 # EWMA -> hysteresis -> at most one knobs RMW write.
                 run_knob_cycle(phase2)
+                # PHASE 3 (energy-adaptive scheduling), additive, same
+                # ladder: battery sample + hysteresis state machine +
+                # at most one batch_slice_ns RMW (the Phase 2 latch
+                # gates both phases' writes); then the 10s accounting
+                # pass; then the 5s probe line when --energy-probe.
+                run_energy_cycle(phase2, energy)
+                run_energy_accounting(acct, rules, state, energy,
+                                      kernel_managed=phase2.kernel_managed)
+                if energy_probe_mode:
+                    maybe_emit_energy_probe(probe, phase2, energy, acct)
                 poll_test_children(children)
                 fail_streak = 0
             except SchedulerGone:

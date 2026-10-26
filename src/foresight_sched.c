@@ -188,8 +188,9 @@ enum foresight_class {
  * PHASE 2 (shared contract): value of the single-entry "knobs"
  * ARRAY map. MUST byte-match `struct sched_knobs` in
  * foresight_sched.bpf.c (u64 interactive_slice_ns; u64
- * batch_slice_ns; u32 demote_streak; u32 _pad = 24 bytes). The
- * loader seeds knobs[0] once after load; the daemon rewrites it
+ * batch_slice_ns; u32 demote_streak; u32 batch_duty_pct = 24 bytes).
+ * The loader seeds knobs[0] once after load (duty 0 = unlimited;
+ * the daemon raises it in CONSERVE mode); the daemon rewrites it
  * through the pin at runtime. Drift is loud, not silent: the
  * kernel checks exact key/value sizes on update, so a struct edit
  * on either side that breaks the 4/24 byte contract fails the
@@ -199,7 +200,7 @@ struct foresight_knobs {
 	__u64	interactive_slice_ns;
 	__u64	batch_slice_ns;
 	__u32	demote_streak;
-	__u32	_pad;
+	__u32	batch_duty_pct;		/* 0 = unlimited (loader seed) */
 };
 
 /*
@@ -527,7 +528,7 @@ static int seed_knobs(struct foresight_sched *skel)
 		.interactive_slice_ns = skel->rodata->__SCX_SLICE_DFL,
 		.batch_slice_ns = skel->rodata->__SCX_SLICE_DFL,
 		.demote_streak = KNOBS_DEMOTE_STREAK_DFL,
-		._pad = 0,
+		.batch_duty_pct = 0,	/* unlimited until CONSERVE */
 	};
 	int ret;
 

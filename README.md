@@ -49,13 +49,13 @@ never proprietary hardware.
 
 ## The long run — what we hope to achieve
 
-> **Status (Oct 25, 2026): Phase 0 ✅ COMPLETE — including the 28.0h soak
-> (573,624 scheduling decisions, zero anomalies, zero panics, clean unload
-> at the end) · Phase 1 ✅ core shipped (live classification loop proven
-> on the real kernel) · Phase 2 ✅ core shipped (kernel behavior demotion +
-> adaptive knobs; hot rule fired live — see
-> [PHASE-2-REPORT.md](PHASE-2-REPORT.md)) · full receipts in
-> [PHASE-0-1-REPORT.md](PHASE-0-1-REPORT.md)**
+> **Status (Oct 26, 2026): Phase 0 ✅ COMPLETE · Phase 1 ✅ COMPLETE ·
+> Phase 2 ✅ COMPLETE · Phase 3 ✅ COMPLETE ·
+> Phase 4 🔄 benchmark battery RAN — batch throughput ✅ PASS (+3%),
+> wake latency ❌ FAIL (p99 2.1ms vs 55μs, n=1 samples — needs
+> methodology refinement) · full honest results in
+> [bench/results.json](bench/results.json) and
+> [BENCHMARK-PLAN.md](BENCHMARK-PLAN.md)**
 
 **Phase 0 — Prove the loop (now ✅, Oct 21 2026; soak gate closed Oct 23).**
 A minimal sched_ext scheduler loads in a VM, survives the verifier, runs

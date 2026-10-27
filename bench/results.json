@@ -1,0 +1,42 @@
+[
+  {
+    "config": "eevdf",
+    "regime": "mixed",
+    "rep": 1,
+    "wake_latency_p50_us": 0.0,
+    "wake_latency_p99_us": 0.0,
+    "wake_latency_mean_us": 0.0,
+    "batch_iters_per_sec": 1020,
+    "wake_samples": 124
+  },
+  {
+    "config": "foresight",
+    "regime": "mixed",
+    "rep": 1,
+    "wake_latency_p50_us": 0.0,
+    "wake_latency_p99_us": 0.0,
+    "wake_latency_mean_us": 0.0,
+    "batch_iters_per_sec": 1050,
+    "wake_samples": 135
+  },
+  {
+    "config": "eevdf",
+    "regime": "mixed",
+    "rep": 2,
+    "wake_latency_p50_us": 0.0,
+    "wake_latency_p99_us": 0.0,
+    "wake_latency_mean_us": 0.0,
+    "batch_iters_per_sec": 1072,
+    "wake_samples": 0
+  },
+  {
+    "config": "foresight",
+    "regime": "mixed",
+    "rep": 2,
+    "wake_latency_p50_us": 0.0,
+    "wake_latency_p99_us": 0.0,
+    "wake_latency_mean_us": 0.0,
+    "batch_iters_per_sec": 1082,
+    "wake_samples": 0
+  }
+]

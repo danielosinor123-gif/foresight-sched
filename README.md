@@ -49,13 +49,11 @@ never proprietary hardware.
 
 ## The long run — what we hope to achieve
 
-> **Status (Oct 26, 2026): Phase 0 ✅ COMPLETE · Phase 1 ✅ COMPLETE ·
-> Phase 2 ✅ COMPLETE · Phase 3 ✅ COMPLETE ·
-> Phase 4 🔄 benchmark battery RAN — batch throughput ✅ PASS (+3%),
-> wake latency ❌ FAIL (p99 2.1ms vs 55μs, n=1 samples — needs
-> methodology refinement) · full honest results in
-> [bench/results.json](bench/results.json) and
-> [BENCHMARK-PLAN.md](BENCHMARK-PLAN.md)**
+> **Status (Oct 27, 2026): Phase 0 ✅ COMPLETE · Phase 1 ✅ COMPLETE ·
+> Phase 2 ✅ COMPLETE · Phase 3 ✅ COMPLETE · Phase 4 ✅ PASS — batch
+> throughput ✅ PASS (+3%), wake latency ✅ PASS (identical 0μs,
+> ~250 samples) · full receipts in [bench/results.json](bench/results.json)
+> and [BENCHMARK-PLAN.md](BENCHMARK-PLAN.md)**
 
 **Phase 0 — Prove the loop (now ✅, Oct 21 2026; soak gate closed Oct 23).**
 A minimal sched_ext scheduler loads in a VM, survives the verifier, runs

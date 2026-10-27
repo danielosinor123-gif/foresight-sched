@@ -180,7 +180,7 @@ expensive facts. No code is trusted until it executes.
 ## Where to find this project
 
 - **GitHub:** https://github.com/danielosinor123-gif/foresight-sched
-- **The arc:** [System Software Futures](https://github.com/danielosinor123-gif/system-software-futures) (the prediction) → [Foresight](https://github.com/danielosinor123-gif/foresight) (userland prototype) → **foresight-sched** (kernel-resident implementation)
+- **The arc:** [System Software Futures](https://github.com/danielosinor123-gif/system-software-futures) (the prediction) → [Foresight](https://github.com/danielosinor123-gif/foresight) (userland prototype) → **foresight-sched** (kernel-resident implementation) → [Inferno](https://github.com/danielosinor123-gif/inferno) (inference runtime layered on top of this scheduler)
 - **Earlier studies:** [The NEXT Top Industries for DS/ML](https://github.com/danielosinor123-gif/ds-ml-industry-prospects) · [ML Niche Challengers](https://github.com/danielosinor123-gif/ds-ml-niche-challengers)
 - Foresight — the userland layer feeding this scheduler
 
